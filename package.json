@@ -1,0 +1,25 @@
+{
+  "name": "siyuan-ai-collab",
+  "version": "0.3.19",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "build": "tsc -p tsconfig.json --noEmit && esbuild src/index.ts --bundle --format=cjs --platform=browser --external:siyuan --outfile=dist/index.js --minify",
+    "package": "npm run build && node scripts/package.mjs"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "jsdom": "^26.1.0",
+    "jszip": "3.10.1",
+    "siyuan": "^1.2.4",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "socket.io-client": "^4.8.3"
+  },
+  "license": "AGPL-3.0-only"
+}

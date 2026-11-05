@@ -1,0 +1,20 @@
+backups/
+dist/
+node_modules/
+*.log
+
+# Private local configuration and runtime state; distribution still uses a whitelist.
+bridge.local.json
+.env
+.env.*
+!.env.example
+.superpowers/
+**/bridge-token
+**/.model-run-token
+**/siyuan-ai-collab-bindings*.json
+**/ekko-connection.json
+**/ekko-pending-sends/
+**/bridge.lock
+**/siyuan-ai-collab-bridge.lock
+
+.cache/

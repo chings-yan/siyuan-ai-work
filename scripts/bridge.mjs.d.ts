@@ -1,0 +1,12 @@
+export function allowedOrigin(origin: string | undefined, origins?: string[]): string | null;
+export function corsHeaders(origin: string | undefined, origins?: string[]): Record<string, string>;
+export function authorize(req: { headers: Record<string, string | undefined> }, capability: string, origins?: string[]): { ok: boolean; status?: number; code?: string };
+export function createBridgeServer(options?: { capability?: string; hermesBase?: string; studioBase?: string; studioToken?: string; tokenProvider?: () => string | Promise<string>; bindingsFile?: string; origins?: string[]; fetchImpl?: (url: string | URL, init?: RequestInit) => Promise<Response> }): { server: { listen: Function; close: Function; address: Function }; capability: string };
+export const DEFAULT_ORIGINS: string[];
+export function studioTokenPath(env?: Record<string, string | undefined>): string;
+export function loadStudioToken(env?: Record<string, string | undefined>): string;
+export type OwnedSession = { id: string; title?: string; [key: string]: unknown };
+export function validateOwnedSession(session: OwnedSession | null | undefined, documentRootId: string | undefined): boolean;
+export function filterOwnedSessions<T extends OwnedSession>(sessions: T[], documentRootId: string | undefined): T[];
+export function findBinding(bindings: Record<string, OwnedSession>, documentRootId: string, sessionId: string): OwnedSession | null;
+export function mergeVisibleSessions(legacy: OwnedSession[], studio: OwnedSession[], bindings: Record<string, OwnedSession>, documentRootId: string): OwnedSession[];

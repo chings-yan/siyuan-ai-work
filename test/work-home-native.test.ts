@@ -1,0 +1,71 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { JSDOM } from 'jsdom';
+import { createRequire } from 'node:module';
+import Module from 'node:module';
+
+test('plugin registers native Home during onload; topbar and Work picker share tab without touching chat', async () => {
+  const dom=new JSDOM('<!doctype html><html><body><main id="page"></main><div class="protyle"><input class="protyle-title__input" value="实际文档"></div><textarea id="draft">保留草稿</textarea></body></html>');
+  Object.assign(globalThis,{document:dom.window.document,window:dom.window,MutationObserver:dom.window.MutationObserver});
+  const opened:any[]=[];let registration:any;let topbar:any;let mounts=0;
+  const originalLoad=(Module as any)._load;
+  (Module as any)._load=function(request:string,parent:any,isMain:boolean){if(request==='siyuan')return {Plugin:class{},getAllEditor:()=>[],openTab:async(options:any)=>{opened.push(options);if(options.custom&&mounts++===0)registration.init.call({element:dom.window.document.querySelector('#page')});return {};}};return originalLoad.call(this,request,parent,isMain);};
+  const require=createRequire(import.meta.url);delete require.cache[require.resolve('../dist/index.js')];
+  let PluginClass:any;try{PluginClass=require('../dist/index.js').default;}finally{(Module as any)._load=originalLoad;}
+  const plugin:any=new PluginClass();plugin.name='siyuan-ai-collab';plugin.app={};
+  plugin.addIcons=()=>{};plugin.addTab=(options:any)=>{registration=options;};plugin.addDock=()=>({});plugin.addTopBar=(options:any)=>{topbar=options;};plugin.loadData=async()=>undefined;plugin.eventBus={on:()=>{},off:()=>{}};
+  plugin.workController.refreshFromEditor=async()=>{};
+  plugin.currentEditor=()=>({protyle:{element:dom.window.document.querySelector('.protyle'),block:{rootID:'20260929120000-aaaaaaa'}}});
+  plugin.onload();
+  try {
+    assert.ok(registration,'onload must synchronously register the native tab');
+    assert.equal(opened.length,0,'startup must not open Home');
+    plugin.workCatalog.load=async()=>({works:[],continueWorks:[],recentTasks:{kind:'found',value:[]}});
+    plugin.onLayoutReady();topbar.callback();await new Promise(resolve=>setTimeout(resolve,10));
+    assert.equal(opened[0].custom.id,'siyuan-ai-collabai-work-home');
+    assert.equal(dom.window.document.querySelector('.sac-page-context'),null,'captured identifiers belong in explicit creation or association, not a permanent Home banner');
+    plugin.workHost.listNotebooks=async()=>[{id:'20260929120001-aaaaaaa',name:'工作本'}];
+    plugin.workHost.getDocumentNotebook=async()=>'20260929120001-aaaaaaa';
+    plugin.workHost.getDocumentTitle=async()=>'冻结的原生文档';
+    plugin.taskReader.listRecent=async()=>({kind:'unavailable',reason:'任务离线'});
+    dom.window.document.querySelector<HTMLButtonElement>('[data-page-action="create"]')!.click();await new Promise(resolve=>setTimeout(resolve,10));
+    const mode=dom.window.document.querySelector<HTMLSelectElement>('[name="mode"]')!;
+    assert.equal(mode.value,'blank');mode.value='current';mode.dispatchEvent(new dom.window.Event('change',{bubbles:true}));
+    assert.match(dom.window.document.querySelector('[aria-label="创建 Work"]')!.textContent||'',/冻结的原生文档/);
+    assert.match(dom.window.document.querySelector('[aria-label="创建 Work"]')!.textContent||'',/20260929120000-aaaaaaa/);
+    await plugin.workController.beginCreate('20260929120002-aaaaaaa');
+    assert.equal(dom.window.document.querySelectorAll('[aria-label="创建 Work"]').length,1);
+    assert.match(dom.window.document.querySelector('[aria-label="创建 Work"]')!.textContent||'',/20260929120000-aaaaaaa/,'an open form must not silently retarget from another entry');
+    dom.window.document.querySelector<HTMLButtonElement>('[data-create-action="close"]')!.click();
+    await plugin.workController.beginCreate('20260929120002-aaaaaaa');
+    assert.match(dom.window.document.querySelector('[aria-label="创建 Work"]')!.textContent||'',/20260929120002-aaaaaaa/);
+    dom.window.document.querySelector<HTMLButtonElement>('[data-create-action="close"]')!.click();
+    await plugin.openWorkPage({kind:'list'});
+    assert.equal(opened[1].custom.id,opened[0].custom.id);assert.equal(mounts,2);
+    assert.equal(dom.window.document.querySelector<HTMLTextAreaElement>('#draft')!.value,'保留草稿');
+    assert.match(dom.window.document.querySelector('#page')!.textContent||'',/选择已有 Work/);
+    assert.equal(plugin.currentDocumentId(),'20260929120000-aaaaaaa');
+    const realController=plugin.workController;
+    let entered=0,associated=0;
+    plugin.workController={currentWorkId:'another-work',enterWork:async()=>{entered++;},flushResume:async()=>{},detach:()=>{}};
+    plugin.showChatDock=()=>dom.window.document.body;
+    plugin.associateStudio=async(_root:any,id:string,current:()=>boolean)=>{associated++;assert.equal(id,'target-work');assert.equal(current(),true);};
+    plugin.workCatalog.load=async()=>({works:[{id:'target-work',record:{value:{id:'target-work',title:'所选 Work',goal:'目标',status:'active'}},documents:{value:[]},tasks:{value:[]},chats:{value:[]},rooms:{value:[]},resume:{value:null}}],continueWorks:[],recentTasks:{kind:'found',value:[]}});
+    await plugin.openWorkPage({kind:'detail',workId:'target-work',section:'sessions'});await new Promise(resolve=>setTimeout(resolve,10));
+    dom.window.document.querySelector<HTMLButtonElement>('[data-page-action="associate-chat"]')!.click();await new Promise(resolve=>setTimeout(resolve,10));
+    assert.equal(entered,0,'association from another Work detail cannot silently switch the active Work');
+    assert.equal(associated,1,'association explicitly targets the displayed Work without navigation');
+
+    plugin.workController=realController;
+    let writes=0;
+    plugin.workService.linkExternalDocument=async()=>{writes++;};
+    plugin.currentEditor=()=>({protyle:{element:dom.window.document.querySelector('.protyle'),block:{rootID:'20260929120003-aaaaaaa'}}});
+    const page=plugin.mountWorkPage(dom.window.document.querySelector('#page'),{documentId:'20260929120000-aaaaaaa',title:'旧文档',focusBlockId:null});
+    await page.refresh();
+    dom.window.document.querySelector<HTMLButtonElement>('[data-work-card] [data-page-action="link"]')!.click();
+    await new Promise(resolve=>setTimeout(resolve,10));
+    assert.equal(writes,0,'stale Home context must not link the previous document after editor navigation');
+    assert.match(dom.window.document.querySelector('#page')!.textContent||'',/当前编辑器已切换文档/);
+    page.dispose();
+  } finally {plugin.onunload();dom.window.close();}
+});
