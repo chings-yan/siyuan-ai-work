@@ -1,0 +1,62 @@
+name: Refresh reviewed 0.3.27 description
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/refresh-release-copy-0.3.27.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refresh-release-copy-0.3.27
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    if: github.repository == 'chings-yan/siyuan-ai-work' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Read the exact approved description
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Update only the existing release description and verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: chings-yan/siyuan-ai-work
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/releases/437449219" > before.json
+          gh api "repos/$GH_REPO/git/ref/tags/v0.3.27" > tag-before.json
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          const sha256 = text => createHash('sha256').update(text).digest('hex');
+          const before = JSON.parse(readFileSync('before.json', 'utf8'));
+          const tag = JSON.parse(readFileSync('tag-before.json', 'utf8'));
+          const body = readFileSync('RELEASE.md', 'utf8');
+          const oldHash = '1f5d1e5804e8db1494a9d33ce71718e3399873890567238b5ce54df752c08661';
+          const newHash = 'e82deac696df5ecc12da766c803111e6165296519aa085082d12036fef72129d';
+          if (sha256(body) !== newHash || ![oldHash, newHash].includes(sha256(before.body))) throw new Error('Description changed outside this approved update');
+          if (before.id !== 437449219 || before.tag_name !== 'v0.3.27' || before.name !== 'Hermes 笔记助手 0.3.27' || before.draft || before.prerelease || before.assets.length !== 6 || tag.object.sha !== 'fcc3fb906039c569965273aefb8c5c6f7ab9798c') throw new Error('Release identity differs');
+          writeFileSync('release-update.json', JSON.stringify({ body }));
+          NODE
+          gh api --method PATCH "repos/$GH_REPO/releases/437449219" --input release-update.json > after.json
+          gh api "repos/$GH_REPO/git/ref/tags/v0.3.27" > tag-after.json
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          const before = JSON.parse(readFileSync('before.json', 'utf8'));
+          const after = JSON.parse(readFileSync('after.json', 'utf8'));
+          const tagBefore = JSON.parse(readFileSync('tag-before.json', 'utf8'));
+          const tagAfter = JSON.parse(readFileSync('tag-after.json', 'utf8'));
+          const assets = release => release.assets.map(({id, name, size, digest}) => ({id, name, size, digest})).sort((a, b) => a.name.localeCompare(b.name));
+          if (after.body !== readFileSync('RELEASE.md', 'utf8') || ['id', 'tag_name', 'name', 'draft', 'prerelease'].some(key => after[key] !== before[key]) || JSON.stringify(assets(after)) !== JSON.stringify(assets(before)) || tagAfter.object.sha !== tagBefore.object.sha) throw new Error('Readback differs from the approved description-only change');
+          console.log(JSON.stringify({url: after.html_url, descriptionUpdated: true, releaseAssetsUnchanged: true, tagUnchanged: true}));
+          NODE
