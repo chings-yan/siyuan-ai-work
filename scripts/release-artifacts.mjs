@@ -9,7 +9,7 @@ import { readProjectLicense } from './package.mjs';
 const scriptRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const gitBlob = bytes => createHash('sha1').update(Buffer.concat([Buffer.from(`blob ${bytes.length}\0`), bytes])).digest('hex');
-const publicRoots = new Set(['.gitignore', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASE.md', 'package.json', 'package-lock.json', 'plugin.json', 'tsconfig.json', 'docs/BRIDGE-SETUP.md', '.github/workflows/publish-0.3.25.yml']);
+const publicRoots = new Set(['.gitignore', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASE.md', 'package.json', 'package-lock.json', 'plugin.json', 'tsconfig.json', 'docs/BRIDGE-SETUP.md', '.github/workflows/publish-0.3.25.yml', '.github/workflows/publish-0.3.26.yml']);
 function safePath(path) {
   return typeof path === 'string' && path.length > 0 && !isAbsolute(path) && !/[\\\u0000-\u001f\u007f<>:"|?*]/.test(path) && path.split('/').every(part => part && part !== '.' && part !== '..' && !/[. ]$/.test(part));
 }

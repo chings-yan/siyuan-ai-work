@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 import { createRequire } from 'node:module';
 import Module from 'node:module';
+import { readFileSync } from 'node:fs';
 
 test('plugin registers native Home during onload; topbar and Work picker share tab without touching chat', async () => {
   const dom=new JSDOM('<!doctype html><html><body><main id="page"></main><div class="protyle"><input class="protyle-title__input" value="实际文档"></div><textarea id="draft">保留草稿</textarea></body></html>');
@@ -21,7 +22,10 @@ test('plugin registers native Home during onload; topbar and Work picker share t
     assert.ok(registration,'onload must synchronously register the native tab');
     assert.equal(opened.length,0,'startup must not open Home');
     plugin.workCatalog.load=async()=>({works:[],continueWorks:[],recentTasks:{kind:'found',value:[]}});
-    plugin.onLayoutReady();topbar.callback();await new Promise(resolve=>setTimeout(resolve,10));
+    plugin.onLayoutReady();
+    const manifest = JSON.parse(readFileSync(new URL('../plugin.json', import.meta.url), 'utf8'));
+    assert.equal(topbar.title, manifest.displayName['zh-CN']);
+    topbar.callback();await new Promise(resolve=>setTimeout(resolve,10));
     assert.equal(opened[0].custom.id,'siyuan-ai-collabai-work-home');
     assert.equal(dom.window.document.querySelector('.sac-page-context'),null,'captured identifiers belong in explicit creation or association, not a permanent Home banner');
     plugin.workHost.listNotebooks=async()=>[{id:'20260929120001-aaaaaaa',name:'工作本'}];

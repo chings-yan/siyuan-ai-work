@@ -2,7 +2,7 @@
   "name": "siyuan-ai-collab",
   "author": "chings-yan",
   "url": "https://github.com/chings-yan/siyuan-ai-work",
-  "version": "0.3.25",
+  "version": "0.3.26",
   "minAppVersion": "3.8.4",
   "backends": [
     "windows"
@@ -11,12 +11,12 @@
     "desktop"
   ],
   "displayName": {
-    "default": "思源 AI Work",
-    "zh-CN": "思源 AI Work"
+    "default": "Hermes Note Assistant",
+    "zh-CN": "Hermes 笔记助手"
   },
   "description": {
-    "default": "Document-first Work, Hermes Chat, explicit context and verified block edits",
-    "zh-CN": "以文档为中心的 Work、Hermes 对话、明确资料与校验后写入"
+    "default": "Chat with Hermes in SiYuan, find and quote notes, and build a workspace by linking documents with the task plugin.",
+    "zh-CN": "在思源里与 Hermes 对话，查找和引用笔记，同时关联文档与任务插件，打造工作空间。"
   },
   "readme": {
     "default": "README.md",
