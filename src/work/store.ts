@@ -85,14 +85,18 @@ export class WorkStore {
     if (!this.migration) this.migration = this.migrateV1().finally(() => { this.migration = null; });
     return structuredClone(await this.migration);
   }
-  private async migrateV1(): Promise<Formal> {
-    const legacy = await this.storage.loadData(FORMAL_V1);
+  private async readLegacyFormal(storage = this.storage): Promise<Formal> {
+    const legacy = await storage.loadData(FORMAL_V1);
     const migrated = missing(legacy) ? emptyFormal() : (() => {
       const old = validateV1(legacy);
       const chats: ChatLink[] = old.chats.map(x => ({ ...x, adapter: 'unresolved', profile: 'default', storedSessionId: null, legacyCandidateId: x.chatId, legacyBridgeUrl: x.connectionId, installId: null, state: 'source-unknown', title: 'Hermes 对话' }));
       return { schema: 2 as const, works: structuredClone(old.works), chats, tasks: structuredClone(old.tasks), pins: structuredClone(old.pins) };
     })();
     validateV2(migrated);
+    return migrated;
+  }
+  private async migrateV1(): Promise<Formal> {
+    const migrated = await this.readLegacyFormal();
     await this.storage.saveData(FORMAL, migrated);
     return migrated;
   }
@@ -104,8 +108,8 @@ export class WorkStore {
     const value = await this.storage.loadData(RESUME);
     return isRecord(value) && value.schema === 1 && isRecord(value.items) ? value as Resume : emptyResume();
   }
-  private async pending(): Promise<Pending> {
-    const value = await this.storage.loadData(PENDING);
+  private async pending(storage = this.storage): Promise<Pending> {
+    const value = await storage.loadData(PENDING);
     if (value === undefined || value === null || value === '') return emptyPending();
     if (!isRecord(value) || value.schema !== 1 || !Array.isArray(value.items)) throw new Error('未决操作数据损坏；已停止写入');
     return structuredClone(value as Pending);
@@ -120,6 +124,11 @@ export class WorkStore {
     await this.enqueue(async () => { const data = await this.formal(); if (!data.works.includes(workId)) { data.works.push(workId); await this.saveFormal(data); } });
   }
   async listChats(workId: string): Promise<ChatLink[]> { return (await this.formal()).chats.filter(x => x.workId === workId); }
+  /** Background inspection never creates or migrates formal relationship files. */
+  async listAllChatsReadOnly(storage = this.storage): Promise<ChatLink[]> {
+    const value = await storage.loadData(FORMAL);
+    return structuredClone((missing(value) ? await this.readLegacyFormal(storage) : validateV2(value)).chats);
+  }
   async listDocumentChats(documentRootId: string): Promise<ChatLink[]> { return (await this.formal()).chats.filter(x => x.workId === null && x.documentRootId === documentRootId); }
   async chatLink(chatId: string): Promise<ChatLink | null> { return (await this.formal()).chats.find(x => x.chatId === chatId) ?? null; }
   async linkChat(link: ChatLink | LegacyChatLink): Promise<void> {
@@ -203,10 +212,26 @@ export class WorkStore {
     await this.enqueue(async () => { const data = await this.resume(); data.items[state.workId] = { ...state }; await this.storage.saveData(RESUME, data); });
   }
   async listPending(): Promise<PendingOperation[]> { return [...(await this.pending()).items]; }
-  async setPending(item: PendingOperation): Promise<void> {
-    await this.enqueue(async () => { const data = await this.pending(); data.items = [...data.items.filter(x => x.id !== item.id), item]; await this.storage.saveData(PENDING, data); });
+  async setPending(item: PendingOperation, options?: {ifAbsent:boolean}): Promise<void> {
+    return this.setPendingUsing(this.storage, item, options);
   }
-  async clearPending(id: string): Promise<void> {
-    await this.enqueue(async () => { const data = await this.pending(); data.items = data.items.filter(x => x.id !== id); await this.storage.saveData(PENDING, data); });
+  async clearPending(id: string, expected?: PendingOperation): Promise<boolean> {
+    return this.clearPendingUsing(this.storage, id, expected);
+  }
+  /** New durable workflows use uncached I/O but keep the original instance mutation queue. */
+  pendingPort(storage: StoragePort): Pick<WorkStore, 'listPending' | 'setPending' | 'clearPending'> {
+    return { listPending: async () => [...(await this.pending(storage)).items],
+      setPending: (item, options) => this.setPendingUsing(storage, item, options),
+      clearPending: (id, expected) => this.clearPendingUsing(storage, id, expected) };
+  }
+  private async setPendingUsing(storage: StoragePort, item: PendingOperation, options?: {ifAbsent:boolean}): Promise<void> {
+    await this.enqueue(async () => { const data = await this.pending(storage); if (options?.ifAbsent && data.items.some(x => x.id === item.id)) throw new Error('原未决记录仍待核对，已阻止覆盖'); data.items = [...data.items.filter(x => x.id !== item.id), item]; await storage.saveData(PENDING, data); });
+  }
+  private async clearPendingUsing(storage: StoragePort, id: string, expected?: PendingOperation): Promise<boolean> {
+    return this.enqueue(async () => {
+      const data = await this.pending(storage), current = data.items.find(x => x.id === id);
+      if (expected && (!current || JSON.stringify(current) !== JSON.stringify(expected))) return false;
+      data.items = data.items.filter(x => x.id !== id); await storage.saveData(PENDING, data); return true;
+    });
   }
 }

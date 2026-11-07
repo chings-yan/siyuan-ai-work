@@ -53,3 +53,13 @@ test('SemVer rejects trailing line terminators in metadata and diagnostic versio
   assert.equal(buildConnectionDiagnostic(null,{...context,pluginVersion:bridgeVersion}).pluginVersion,null);
  }
 });
+
+test('shared capability is accepted only by strict metadata whitelist without version inference',()=>{
+ assert.deepEqual(parseCompanionMetadata({schemaVersion:1,bridgeVersion:null,capabilities:['hermes-shared-session-v1','private']}),{schemaVersion:1,bridgeVersion:null,capabilities:['hermes-shared-session-v1']});
+ assert.deepEqual(parseCompanionMetadata({schemaVersion:1,bridgeVersion:'99.0.0',capabilities:[]})?.capabilities,[]);
+ assert.equal(parseCompanionMetadata({schemaVersion:2,bridgeVersion:'99.0.0',capabilities:['hermes-shared-session-v1']}),null);
+});
+test('read snapshots require the exact advertised capability and never infer it from a version',()=>{
+ assert.deepEqual(parseCompanionMetadata({schemaVersion:1,bridgeVersion:null,capabilities:['hermes-history-snapshot-v1','unknown']})?.capabilities,['hermes-history-snapshot-v1']);
+ assert.deepEqual(parseCompanionMetadata({schemaVersion:1,bridgeVersion:'99.0.0',capabilities:[]})?.capabilities,[]);
+});

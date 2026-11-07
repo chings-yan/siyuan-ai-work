@@ -6,8 +6,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveBridgeConfig, loadBridgeEnvironment } from './bridge-config.mjs';
-import { readBindings, normalizeStudioSessions, normalizeStudioMessages, buildRunPayload, validateDocumentTitle, safeBinding, runStudioSocket, fetchStudioMessagesPaginated, fetchStudioSessionsPaginated, isUnresolvedStudioSession } from './studio-client.mjs';
-import { connectionRegistry, readServeToken, probeServe, probeStudio, probeLegacy } from './hermes-connections.mjs';
+import { readBindings, normalizeStudioSessions, normalizeStudioMessages, buildRunPayload, validateDocumentTitle, safeBinding, runStudioSocket, fetchStudioMessagesPaginated, fetchStudioMessagesSnapshot, fetchStudioSessionsPaginated, isUnresolvedStudioSession } from './studio-client.mjs';
+import { snapshotError, assertSnapshotActive, withSnapshotDeadline, captureHistorySnapshot, snapshotDisplayMessages } from './hermes-history-snapshot.mjs';
+import { connectionRegistry, readServeToken, probeServe, probeStudio, probeLegacy, assertLoopbackServeUrl } from './hermes-connections.mjs';
+import { createSessionRunCoordinator } from './hermes-session-runs.mjs';
 import { createGatewayClient } from './hermes-gateway-client.mjs';
 import { readChatBindings, mutateChatBindings, mutateLegacyBindings, assertChatScope, validChatId } from './bridge-chat-store.mjs';
 
@@ -120,10 +122,19 @@ async function pingServe(connection, token, signal) {
   });
 }
 
-export function createBridgeServer({ fetchImpl = fetch, capability = loadCapability(), hermesBase = (process.env.HERMES_API_URL || 'http://127.0.0.1:8642').replace(/\/$/, ''), studioBase = (process.env.HERMES_STUDIO_URL || 'http://127.0.0.1:8748').replace(/\/$/, ''), studioToken, tokenProvider, probeTimeoutMs = 5_000, studioRun = runStudioSocket, bindingsFile = resolveBridgeConfig().bindingsFile, bindingsV2File = process.env.SIYUAN_BRIDGE_BINDINGS_V2_FILE || join(dirname(bindingsFile), 'siyuan-ai-collab-bindings-v2.json'), origins = DEFAULT_ORIGINS, ekko = {}, connections = connectionRegistry(), gatewayFactory = ({ connection, token }) => ({ ...createGatewayClient({ baseUrl: connection.baseUrl, token, profile: connection.profile, fetchImpl }), ping: ({ signal } = {}) => pingServe(connection, token, signal) }) } = {}) {
+export function createBridgeServer({ fetchImpl = fetch, capability = loadCapability(), hermesBase = (process.env.HERMES_API_URL || 'http://127.0.0.1:8642').replace(/\/$/, ''), studioBase = (process.env.HERMES_STUDIO_URL || 'http://127.0.0.1:8748').replace(/\/$/, ''), studioToken, tokenProvider, probeTimeoutMs = 5_000, snapshotTimeoutMs = 10_000, studioRun = runStudioSocket, bindingsFile = resolveBridgeConfig().bindingsFile, bindingsV2File = process.env.SIYUAN_BRIDGE_BINDINGS_V2_FILE || join(dirname(bindingsFile), 'siyuan-ai-collab-bindings-v2.json'), origins = DEFAULT_ORIGINS, ekko = {}, connections = connectionRegistry(), gatewayFactory = ({ connection, token }) => ({ ...createGatewayClient({ baseUrl: connection.baseUrl, token, profile: connection.profile, fetchImpl }), ping: ({ signal } = {}) => pingServe(connection, token, signal) }) } = {}) {
   const ekkoRoutes = createEkkoRouteHandler({ fetchImpl, ...ekko });
   const activeChats = new Set();
   const sessionRuntime = new Map();
+  const runs = createSessionRunCoordinator({ bindingsV2File, bindingsFile });
+  const runOwner = binding => ({ kind: 'v2', chatId: binding.chatId, documentRootId: binding.documentRootId });
+  const runIdentity = binding => Object.fromEntries(['connectionId', 'kind', 'profile', 'storedSessionId', 'installId'].map(key => [key, binding[key]]));
+  const legacyRunIdentity = binding => {
+    const matches = connections.connections.filter(item => item.kind === 'studio' && item.profile === binding.profile);
+    if (binding.source !== 'studio' || matches.length !== 1) throw chatError(409, 'session_identity_unknown', '会话运行身份待核对');
+    return { connectionId: matches[0].id, kind: 'studio', profile: binding.profile, storedSessionId: binding.id, installId: null };
+  };
+  const terminalReceipt = (source, terminal) => ({ source, terminal, verified: true });
   const connectionById = id => connections.connections.find(item => item.id === id);
   const chatError = (status, code, message) => Object.assign(new Error(message), { status, code });
   const safeErrors = new Map(Object.entries({
@@ -139,12 +150,21 @@ export function createBridgeServer({ fetchImpl = fetch, capability = loadCapabil
     studio_history_failed: [503, 'Studio 历史读取失败'], auth_missing: [401, 'Hermes Serve 凭证缺失'],
     auth_failed: [401, 'Hermes Serve 认证失败'], offline: [503, 'Hermes Serve 不可用'],
     incompatible: [503, 'Hermes Serve 协议不兼容'],
+    session_busy: [409, '这段对话正在处理'], session_result_unknown: [409, '上次运行结果待核对'],
+    session_identity_unknown: [409, '会话运行身份待核对'],
+    history_snapshot_unsupported: [422, '此历史来源暂不支持核验回复进度'],
+    history_snapshot_unverified: [503, '历史完整性尚未核验；回复进度保持原样'],
+    history_snapshot_changed: [409, '历史或关联正在变化；回复进度保持原样'],
+    history_snapshot_timeout: [504, '历史核验超时；回复进度保持原样'],
   }));
-  const assertStudioClaim = (old, id, root) => {
-    if (Object.values(old).some(binding => binding?.id === id && binding.documentRootId !== root)) throw chatError(409, 'session_claimed', 'Studio 会话已属于其他文档');
+  const assertStudioClaim = (old, id, root, profile = 'default') => {
+    const previous = old[`${root}:${id}`];
+    if (previous && (previous.id !== id || previous.documentRootId !== root || previous.profile !== profile || previous.source !== 'studio')) throw chatError(409, 'chat_conflict', '原 Studio 关联身份不符');
   };
-  const assertV2Claim = (current, connectionId, sessionId, root, chatId) => {
-    if (Object.values(current).some(binding => binding?.connectionId === connectionId && binding.storedSessionId === sessionId && binding.chatId !== chatId)) throw chatError(409, 'session_claimed', '会话已关联其他 Chat');
+  const sameBindingIdentity = (a, b) => ['chatId', 'connectionId', 'kind', 'profile', 'storedSessionId', 'installId', 'documentRootId'].every(key => a[key] === b[key]);
+  const assertV2Claim = (current, requested) => {
+    if (Object.values(current).some(binding => binding.chatId !== requested.chatId && binding.connectionId === requested.connectionId && binding.storedSessionId === requested.storedSessionId
+      && (requested.kind === 'legacy-api' || binding.documentRootId === requested.documentRootId && binding.kind === requested.kind && binding.profile === requested.profile && binding.installId === requested.installId))) throw chatError(409, 'session_claimed', '会话已有关联入口');
   };
   const publicChat = binding => ({ chatId: binding.chatId, connectionId: binding.connectionId, kind: binding.kind, profile: binding.profile, documentRootId: binding.documentRootId, title: binding.title, state: binding.state, storedSessionId: binding.storedSessionId, installId: binding.installId });
   const messageId = message => message?.id == null ? (message?.row_id == null ? null : String(message.row_id)) : String(message.id);
@@ -239,6 +259,52 @@ export function createBridgeServer({ fetchImpl = fetch, capability = loadCapabil
           return latest?.pending ? { ...current, [`${documentRootId}:${id}`]: { ...latest, pending:false, updatedAt:new Date().toISOString() } } : undefined;
         });
       };
+      const executeStudio = async ({ owner, identity, input, instructions, streaming, finalize, update }) => {
+        const lease = await runs.begin(owner, identity);
+        const controller = new AbortController();
+        const abort = () => { if (!res.writableEnded) controller.abort(); };
+        req.on('aborted', abort); res.on('close', abort);
+        let live = true, accepted = false;
+        let writes = Promise.resolve(), writeError, completionEvent, failureEvent, failed = false, text = '';
+        if (streaming) res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', ...corsHeaders(origin, origins) });
+        try {
+          const result = await studioRun({ studioBase, token: studioToken, tokenProvider: tokenProvider || (() => studioToken ?? loadStudioToken()),
+            payload: buildRunPayload({ sessionId: identity.storedSessionId, input, instructions }), signal: controller.signal,
+            canAbort: () => live && accepted,
+            onEvent: (event, data) => {
+              if (!live) return;
+              if (event === 'run.completed') { live = false; completionEvent = data ?? {}; }
+              else if (event === 'run.failed') { live = false; failed = true; failureEvent = data ?? {}; }
+              else if (event === 'run.started') {
+                writes = writes.then(async () => { if (await runs.transition(lease, 'streaming')) { accepted = live && !controller.signal.aborted; if (streaming) writeSse(res, event, { ...(data ?? {}), runId: lease.attemptId }); } }).catch(error => { writeError = error; controller.abort(); });
+              } else {
+                if (event === 'message.delta') text += String(data?.delta ?? data?.content ?? '');
+                if (streaming) writeSse(res, event, data ?? {});
+              }
+            } });
+          live = false;
+          await writes;
+          if (writeError) throw writeError;
+          if (controller.signal.aborted || failed) throw new Error('Studio run unresolved');
+          await finalize();
+          await update?.('ready');
+          await runs.transition(lease, 'completed', terminalReceipt('studio', 'completed'));
+          if (streaming) writeSse(res, 'run.completed', completionEvent ?? { content: String(result?.content ?? '') });
+          else json(res, 200, { session_id: identity.storedSessionId, message: { role: 'assistant', content: text || String(result?.content ?? result?.message?.content ?? '') } }, origin, origins);
+        } catch {
+          live = false;
+          await writes;
+          const phase = failed && !controller.signal.aborted && !writeError ? 'failed' : 'unknown';
+          await update?.(phase === 'failed' ? 'ready' : 'unknown');
+          await runs.transition(lease, phase, phase === 'failed' ? terminalReceipt('studio', 'failed') : undefined);
+          if (streaming) writeSse(res, phase === 'failed' ? 'run.failed' : 'run.unknown', owner.kind === 'v2' ? { chatId: owner.chatId } : phase === 'failed' ? failureEvent : {});
+          else throw chatError(409, 'session_result_unknown', '上次运行结果待核对');
+        } finally {
+          live = false;
+          runs.release(lease); req.off('aborted', abort); res.off('close', abort);
+          if (streaming && !res.writableEnded) res.end();
+        }
+      };
       const studioSessions = async () => {
         const indexResponse = await studioForward('/api/studio/sessions');
         const indexBody = await indexResponse.json().catch(() => ({}));
@@ -318,9 +384,8 @@ export function createBridgeServer({ fetchImpl = fetch, capability = loadCapabil
         if (!validChatId(chatId) || !sessionId || !connection) throw chatError(400, 'invalid_binding', '关联参数无效');
         if (chatId.startsWith('siyuan:') && !chatId.startsWith(`siyuan:${documentRootId}:`)) throw chatError(400, 'invalid_binding', '旧 Chat 标识与文档不符');
         const existingV2 = await readChatBindings(bindingsV2File);
-        if (existingV2[chatId] && (existingV2[chatId].connectionId !== connection.id || existingV2[chatId].storedSessionId !== sessionId || existingV2[chatId].documentRootId !== documentRootId)) throw chatError(409, 'chat_conflict', 'Chat 标识已绑定');
-        assertV2Claim(existingV2, connection.id, sessionId, documentRootId, chatId);
-        if (connection.kind === 'studio') assertStudioClaim(await readBindings(bindingsFile), sessionId, documentRootId);
+        if (existingV2[chatId] && (existingV2[chatId].connectionId !== connection.id || existingV2[chatId].storedSessionId !== sessionId || existingV2[chatId].documentRootId !== documentRootId || existingV2[chatId].kind !== connection.kind || existingV2[chatId].profile !== connection.profile)) throw chatError(409, 'chat_conflict', 'Chat 标识已绑定');
+        if (connection.kind === 'studio') assertStudioClaim(await readBindings(bindingsFile), sessionId, documentRootId, connection.profile);
         let title = '';
         let installId = null;
         let anchor = null;
@@ -346,14 +411,19 @@ export function createBridgeServer({ fetchImpl = fetch, capability = loadCapabil
           if (!response.ok || !validateOwnedSession(candidate?.session || candidate, documentRootId)) throw chatError(403, 'session_scope_denied', '旧 API 会话无法验证归属');
           title = String((candidate.session || candidate).title || '已关联对话');
         }
-        const binding = { chatId, connectionId: connection.id, kind: connection.kind, profile: connection.profile, documentRootId, title, state: 'ready', storedSessionId: sessionId, installId, anchor };
+        let binding = { chatId, connectionId: connection.id, kind: connection.kind, profile: connection.profile, documentRootId, title, state: 'ready', storedSessionId: sessionId, installId, anchor };
         await mutateChatBindings(bindingsV2File, current => {
-          assertV2Claim(current, connection.id, sessionId, documentRootId, chatId);
-          if (current[chatId] && JSON.stringify(current[chatId]) !== JSON.stringify(binding)) throw chatError(409, 'chat_conflict', 'Chat 标识已绑定');
+          const previous = current[chatId];
+          if (previous) {
+            if (!sameBindingIdentity(previous, binding)) throw chatError(409, 'chat_conflict', 'Chat 标识已绑定');
+            binding = previous;
+            return undefined;
+          }
+          assertV2Claim(current, binding);
           return { ...current, [chatId]: binding };
         });
         if (connection.kind === 'studio') await mutateLegacyBindings(bindingsFile, old => {
-          assertStudioClaim(old, sessionId, documentRootId);
+          assertStudioClaim(old, sessionId, documentRootId, connection.profile);
           const key = `${documentRootId}:${sessionId}`;
           return old[key] ? undefined : { ...old, [key]: { id: sessionId, title, documentRootId, updatedAt: new Date().toISOString(), source: 'studio', profile: connection.profile } };
         });
@@ -361,8 +431,20 @@ export function createBridgeServer({ fetchImpl = fetch, capability = loadCapabil
       }
       if (p === '/chats' && req.method === 'GET') {
         const current = await readChatBindings(bindingsV2File);
-        const rows = Object.values(current).filter(binding => binding.documentRootId === documentRootId);
-        for (const binding of rows) await verifyConnection(binding);
+        const filters = new URL(req.url, 'http://bridge').searchParams.getAll('connection_id');
+        if (filters.length > 1 || filters.length && !/^[A-Za-z0-9_-]{1,160}$/.test(filters[0])) throw chatError(400, 'invalid_binding', '连接筛选参数无效');
+        if (filters.length && !connectionById(filters[0])) throw chatError(404, 'connection_not_found', '连接不存在');
+        const rows = Object.values(current).filter(binding => binding.documentRootId === documentRootId && (!filters.length || binding.connectionId === filters[0]));
+        // Shared recovery needs both Studio projections. A failed second-file
+        // transaction must not turn its surviving V2 row into ready evidence.
+        const studioProjection = filters.length && rows.some(binding => binding.kind === 'studio') ? await readBindings(bindingsFile) : null;
+        for (const binding of rows) {
+          await verifyConnection(binding);
+          if (studioProjection && binding.kind === 'studio') {
+            if (!studioProjection[`${binding.documentRootId}:${binding.storedSessionId}`]) throw chatError(409, 'chat_conflict', '原 Studio 关联尚未核实');
+            assertStudioClaim(studioProjection, binding.storedSessionId, binding.documentRootId, binding.profile);
+          }
+        }
         json(res, 200, { data: rows.map(publicChat) }, origin, origins); return;
       }
       if (p === '/legacy-bindings' && req.method === 'GET') {
@@ -370,21 +452,102 @@ export function createBridgeServer({ fetchImpl = fetch, capability = loadCapabil
         const data = Object.values(old).filter(binding => binding?.documentRootId === documentRootId && binding?.profile === 'default' && binding?.source === 'studio' && typeof binding.id === 'string').map(binding => ({ chatId: binding.id, connectionId: 'studio-default', adapter: 'studio', profile: 'default', storedSessionId: binding.id, documentRootId: binding.documentRootId, installId: null }));
         json(res, 200, { data }, origin, origins); return;
       }
+      const snapshotMatch = p.match(/^\/chats\/([^/]+)\/messages\/snapshot$/);
+      if (snapshotMatch) {
+        if (req.method !== 'GET') { json(res, 405, { error: { code: 'method_not_allowed', message: 'GET required' } }, origin, origins); return; }
+        const chatId = decodeURIComponent(snapshotMatch[1]);
+        const snapshot = await withSnapshotDeadline(async signal => {
+          // Deliberately bypass liveChat: its recovery of an orphaned creating
+          // state writes the binding. This path must not mutate any state.
+          const binding = (await readChatBindings(bindingsV2File))[chatId];
+          assertSnapshotActive(signal);
+          if (!binding) throw chatError(404, 'chat_not_found', 'Chat 不存在');
+          assertChatScope(binding, documentRootId);
+          if (!['serve', 'studio'].includes(binding.kind)) throw snapshotError('history_snapshot_unsupported');
+          if (!binding.storedSessionId) throw snapshotError();
+          const verifySnapshotConnection = async () => {
+            const current = connectionById(binding.connectionId);
+            if (!current || current.profile !== binding.profile || current.kind !== binding.kind) throw chatError(409, 'connection_changed', '连接配置已变化');
+            if (binding.kind === 'serve') {
+              if (typeof binding.installId !== 'string' || !binding.installId) throw snapshotError();
+              const response = await fetchImpl(new URL('/api/status', assertLoopbackServeUrl(current.baseUrl)), { method: 'GET', redirect: 'error', signal });
+              assertSnapshotActive(signal);
+              if (!response.ok || response.redirected || response.status >= 300) throw snapshotError();
+              const status = await response.json();
+              assertSnapshotActive(signal);
+              if (status?.install_id !== binding.installId) throw chatError(409, 'install_changed', 'Hermes 安装标识已变化');
+            }
+            return current;
+          };
+          const connection = await verifySnapshotConnection();
+          assertSnapshotActive(signal);
+          // One approved credential is held for this bounded operation; a 401
+          // never causes a second authorization source or an automatic retry.
+          const snapshotStudioToken = binding.kind === 'studio' ? await (tokenProvider || (() => studioToken ?? loadStudioToken()))() : undefined;
+          assertSnapshotActive(signal);
+          const source = Object.fromEntries(['chatId', 'documentRootId', 'connectionId', 'kind', 'profile', 'storedSessionId', 'installId'].map(key => [key, binding[key]]));
+          const readComplete = async () => {
+            assertSnapshotActive(signal);
+            if (binding.kind === 'studio') {
+              // This read does not rotate/retry authorization or call any of
+              // the mutable compatibility paths.
+              const result = await fetchStudioMessagesSnapshot({ sessionId: binding.storedSessionId, profile: binding.profile, signal,
+                fetchPage: async (offset, limit) => {
+                  assertSnapshotActive(signal);
+                  const query = new URLSearchParams({ profile: binding.profile, offset: String(offset), limit: String(limit) });
+                  const response = await fetchImpl(`${studioBase}/api/studio/sessions/conversations/${encodeURIComponent(binding.storedSessionId)}/messages/paginated?${query}`, {
+                    method: 'GET', redirect: 'error', signal, headers: snapshotStudioToken ? { Authorization: `Bearer ${snapshotStudioToken}` } : {},
+                  });
+                  assertSnapshotActive(signal);
+                  if (!response.ok || response.redirected || response.status >= 300) throw snapshotError();
+                  return response.json();
+                },
+              });
+              return { records: result.records, messages: snapshotDisplayMessages(result.records) };
+            }
+            const gateway = await gatewayFor(connection);
+            const close = () => gateway.close?.();
+            if (signal.aborted) { close(); assertSnapshotActive(signal); }
+            signal.addEventListener('abort', close, { once: true });
+            try {
+              const history = await gateway.history(binding.storedSessionId, { captureSnapshotRecords: true });
+              assertSnapshotActive(signal);
+              if (!Array.isArray(history?.snapshotRecords) || !Array.isArray(history.messages) || history.count !== history.messages.length) throw snapshotError();
+              checkAnchor(binding, history.messages);
+              return { records: history.snapshotRecords, messages: snapshotDisplayMessages(history.messages, { idKey: 'row_id', contentKey: 'text' }) };
+            } catch (error) {
+              if (error?.code === 'history_anchor_mismatch' || error?.code === 'history_snapshot_timeout') throw error;
+              throw snapshotError();
+            } finally { signal.removeEventListener('abort', close); close(); }
+          };
+          return captureHistorySnapshot({ source, readComplete, signal, verifyUnchanged: async () => {
+            await verifySnapshotConnection();
+            assertSnapshotActive(signal);
+            const current = (await readChatBindings(bindingsV2File))[chatId];
+            if (!current || !sameBindingIdentity(binding, current) || JSON.stringify(binding.anchor) !== JSON.stringify(current.anchor)) throw snapshotError('history_snapshot_changed');
+          } });
+        }, snapshotTimeoutMs);
+        json(res, 200, { snapshot }, origin, origins); return;
+      }
       const chatMatch = p.match(/^\/chats\/([^/]+)(\/messages|\/chat\/stream|\/status|\/stop)?$/);
       if (chatMatch) {
         const chatId = decodeURIComponent(chatMatch[1]);
         const binding = await liveChat(chatId);
         assertChatScope(binding, documentRootId);
         const connection = await verifyConnection(binding);
-        if (chatMatch[2] === '/status' && req.method === 'GET') { json(res, 200, { chatId, state: binding.state, lastRunState: binding.lastRunState || null }, origin, origins); return; }
+        if (chatMatch[2] === '/status' && req.method === 'GET') { const run = binding.kind === 'legacy-api' ? { state: 'idle' } : await runs.inspect(runIdentity(binding), runOwner(binding)); json(res, 200, { chatId, state: binding.state, lastRunState: binding.lastRunState || null, ...(run.state === 'idle' ? {} : { run }) }, origin, origins); return; }
         if (chatMatch[2] === '/stop' && req.method === 'POST') {
-          const runtimeSessionId = sessionRuntime.get(chatId);
-          if (!runtimeSessionId) { json(res, 200, { state: activeChats.has(chatId) ? 'unknown' : 'not_running' }, origin, origins); return; }
-          if (binding.kind !== 'serve') { json(res, 200, { state: 'not_running' }, origin, origins); return; }
-          sessionRuntime.delete(chatId);
+          const body = await readBody(req);
+          const ticket = sessionRuntime.get(chatId);
+          const run = binding.kind === 'legacy-api' ? { state: 'idle' } : await runs.inspect(runIdentity(binding), runOwner(binding));
+          if (!ticket || body.runId !== ticket.runId || run.state !== 'streaming' || !run.isOwner || binding.kind !== 'serve') {
+            json(res, 200, { state: activeChats.has(chatId) || run.state !== 'idle' ? 'unknown' : 'not_running' }, origin, origins); return;
+          }
           const gateway = await gatewayFor(connection);
           try {
-            const result = await gateway.interrupt(runtimeSessionId);
+            if (sessionRuntime.get(chatId) !== ticket) { json(res, 200, { state: 'unknown' }, origin, origins); return; }
+            sessionRuntime.delete(chatId);
+            const result = await gateway.interrupt(ticket.runtimeSessionId);
             json(res, 200, { state: result?.status === 'interrupted' ? 'interrupted' : 'unknown' }, origin, origins);
           } finally { gateway.close?.(); }
           return;
@@ -403,26 +566,8 @@ export function createBridgeServer({ fetchImpl = fetch, capability = loadCapabil
           const input = typeof body.message === 'string' ? body.message : '';
           if (!input.trim()) throw chatError(400, 'empty_message', '消息不能为空');
           if (binding.state === 'unknown') throw chatError(409, 'chat_result_unknown', '上一轮结果未核实');
-          if (activeChats.has(chatId)) throw chatError(409, 'chat_busy', 'Chat 正在处理');
-          activeChats.add(chatId);
-          const controller = new AbortController();
-          const abort = () => controller.abort();
-          req.on('aborted', abort); res.on('close', abort);
-          res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', ...corsHeaders(origin, origins) });
-          try {
-            let completionEvent = null;
-            const completed = await studioRun({ studioBase, token: studioToken, tokenProvider: tokenProvider || (() => studioToken ?? loadStudioToken()), payload: buildRunPayload({ sessionId: binding.storedSessionId, input, instructions: String(body.system_message || '') }), signal: controller.signal, onEvent: (event, data) => { if (event === 'run.completed') completionEvent = data ?? {}; else if (event !== 'run.failed') writeSse(res, event, data ?? {}); } });
-            const old = await readBindings(bindingsFile);
-            const key = `${documentRootId}:${binding.storedSessionId}`;
-            if (old[key]?.pending) {
-              const renamed = await studioForward(`/api/studio/sessions/${encodeURIComponent(binding.storedSessionId)}/rename`, { method: 'POST', body: JSON.stringify({ title: binding.title }) });
-              if (!renamed.ok) throw new Error('Studio rename failed');
-              await mutateLegacyBindings(bindingsFile, current => current[key]?.pending ? { ...current, [key]: { ...current[key], pending: false, updatedAt: new Date().toISOString() } } : undefined);
-            }
-            await saveChat(chatId, { state: 'ready' });
-            writeSse(res, 'run.completed', completionEvent ?? { text: String(completed?.content ?? '') });
-          } catch { await saveChat(chatId, { state: 'unknown' }); writeSse(res, 'run.unknown', { chatId }); }
-          finally { req.off('aborted', abort); res.off('close', abort); activeChats.delete(chatId); if (!res.writableEnded) res.end(); }
+          await executeStudio({ owner: runOwner(binding), identity: runIdentity(binding), input, instructions: String(body.system_message || ''), streaming: true,
+            finalize: () => finalizePendingStudioSession(binding.storedSessionId), update: state => saveChat(chatId, { state }) });
           return;
         }
         if (binding.kind !== 'serve' && chatMatch[2]) {
@@ -458,58 +603,81 @@ export function createBridgeServer({ fetchImpl = fetch, capability = loadCapabil
               const history = await gateway.history(binding.storedSessionId);
               checkAnchor(binding, Array.isArray(history?.messages) ? history.messages : []);
             }
-            if (!binding.storedSessionId) await saveChat(chatId, { state: 'creating' });
-            const controller = new AbortController();
-            const abort = () => controller.abort();
-            req.on('aborted', abort); res.on('close', abort);
-            res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', ...corsHeaders(origin, origins) });
-            let runtimeSessionId;
+            const lease = await runs.begin(runOwner(binding), runIdentity(binding));
             try {
-              if (!binding.storedSessionId) {
-                const created = await gateway.create(binding.title);
-                runtimeSessionId = created.runtimeSessionId;
-                await saveChat(chatId, { storedSessionId: created.storedSessionId, state: 'pending' });
-              } else runtimeSessionId = await gateway.resume(binding.storedSessionId);
-              // Hermes prompt.submit accepts one text field, so preserve the frozen context in that field.
-              const submitText = systemMessage ? `${systemMessage}\n\n【用户问题】\n${message}` : message;
-              let acceptedUserRowId = null;
-              const result = await gateway.submit(runtimeSessionId, submitText, { signal: controller.signal, onEvent: event => {
-                if (event?.type === 'message.complete') sessionRuntime.delete(chatId);
-                if (event?.type === 'message.delta') {
-                  const delta = typeof event.payload?.delta === 'string' ? event.payload.delta : event.payload?.text;
-                  if (typeof delta === 'string') writeSse(res, 'message.delta', { delta });
+              if (!binding.storedSessionId) await saveChat(chatId, { state: 'creating' });
+              let runtimeSessionId, ticketClosed = false;
+              const controller = new AbortController();
+              const retireTicket = () => {
+                ticketClosed = true;
+                if (sessionRuntime.get(chatId)?.runId === lease.attemptId) sessionRuntime.delete(chatId);
+              };
+              const abort = () => { retireTicket(); controller.abort(); };
+              req.on('aborted', abort); res.on('close', abort);
+              res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', ...corsHeaders(origin, origins) });
+              try {
+                if (!binding.storedSessionId) {
+                  const created = await gateway.create(binding.title);
+                  runtimeSessionId = created.runtimeSessionId;
+                  await runs.attachSession(lease, { ...runIdentity(binding), storedSessionId: created.storedSessionId });
+                  await saveChat(chatId, { state: 'pending' });
+                } else runtimeSessionId = await gateway.resume(binding.storedSessionId);
+                // Hermes prompt.submit accepts one text field, so preserve the frozen context in that field.
+                const submitText = systemMessage ? `${systemMessage}\n\n【用户问题】\n${message}` : message;
+                let acceptedUserRowId = null;
+                let acceptance = Promise.resolve(), acceptanceError;
+                const result = await gateway.submit(runtimeSessionId, submitText, { signal: controller.signal, onEvent: event => {
+                  if (event?.type === 'message.complete') retireTicket();
+                  if (event?.type === 'message.delta') {
+                    const delta = typeof event.payload?.delta === 'string' ? event.payload.delta : event.payload?.text;
+                    if (typeof delta === 'string') writeSse(res, 'message.delta', { delta });
+                  }
+                }, onAccepted: accepted => {
+                  if (accepted?.status === 'streaming' && typeof accepted.userRowId === 'number') {
+                    acceptedUserRowId = accepted.userRowId;
+                    acceptance = acceptance.then(async () => {
+                      if (await runs.transition(lease, 'streaming')) {
+                        if (!ticketClosed && !controller.signal.aborted) sessionRuntime.set(chatId, { runtimeSessionId, runId: lease.attemptId });
+                        writeSse(res, 'run.started', { chatId, userRowId: accepted.userRowId, runId: lease.attemptId });
+                      }
+                    }).catch(error => { acceptanceError = error; controller.abort(); });
+                  }
+                } });
+                // A returned outcome ends the live stop window before any history read or disk write.
+                retireTicket();
+                await acceptance;
+                if (acceptanceError) throw acceptanceError;
+                const userRowId = typeof result.userRowId === 'number' ? result.userRowId : acceptedUserRowId;
+                if (result.state === 'queued') {
+                  await saveChat(chatId, { state: 'pending', lastRunState: 'queued' });
+                  await runs.transition(lease, 'queued');
+                  writeSse(res, 'run.queued', { chatId });
+                } else if (userRowId !== null) {
+                  let persisted = result.state !== 'unknown';
+                  if (!persisted) {
+                    try {
+                      const history = await gateway.history((await liveChat(chatId)).storedSessionId);
+                      const messages = Array.isArray(history?.messages) ? history.messages : [];
+                      const lastUser = messages.filter(row => row?.role === 'user').at(-1);
+                      persisted = Number(lastUser?.row_id ?? lastUser?.id) === userRowId && String(lastUser?.text ?? lastUser?.content ?? '') === submitText;
+                    } catch { persisted = false; }
+                  }
+                  await saveChat(chatId, { state: persisted ? 'ready' : 'unknown', lastRunState: result.state });
+                  const phase = controller.signal.aborted ? 'unknown' : result.state === 'complete' ? 'completed' : ['failed', 'interrupted'].includes(result.state) ? 'failed' : 'unknown';
+                  await runs.transition(lease, phase, phase === 'unknown' ? undefined : terminalReceipt('serve', phase));
+                  writeSse(res, phase === 'completed' ? 'run.completed' : phase === 'unknown' ? 'run.unknown' : 'run.failed', { chatId, text: result.text, userRowId });
+                } else {
+                  await saveChat(chatId, { state: 'unknown', lastRunState: result.state });
+                  await runs.transition(lease, 'unknown');
+                  writeSse(res, result.state === 'failed' ? 'run.failed' : 'run.unknown', { chatId });
                 }
-              }, onAccepted: accepted => {
-                if (accepted?.status === 'streaming' && typeof accepted.userRowId === 'number') {
-                  acceptedUserRowId = accepted.userRowId;
-                  sessionRuntime.set(chatId, runtimeSessionId);
-                  writeSse(res, 'run.started', { chatId, userRowId: accepted.userRowId });
-                }
-              } });
-              const userRowId = typeof result.userRowId === 'number' ? result.userRowId : acceptedUserRowId;
-              if (result.state === 'queued') {
-                await saveChat(chatId, { state: 'pending', lastRunState: 'queued' });
-                writeSse(res, 'run.queued', { chatId });
-              } else if (userRowId !== null) {
-                let persisted = result.state !== 'unknown';
-                if (!persisted) {
-                  try {
-                    const history = await gateway.history((await liveChat(chatId)).storedSessionId);
-                    const messages = Array.isArray(history?.messages) ? history.messages : [];
-                    const lastUser = messages.filter(row => row?.role === 'user').at(-1);
-                    persisted = Number(lastUser?.row_id ?? lastUser?.id) === userRowId && String(lastUser?.text ?? lastUser?.content ?? '') === submitText;
-                  } catch { persisted = false; }
-                }
-                await saveChat(chatId, { state: persisted ? 'ready' : 'unknown', lastRunState: result.state });
-                writeSse(res, result.state === 'complete' ? 'run.completed' : result.state === 'unknown' ? 'run.unknown' : 'run.failed', { chatId, text: result.text, userRowId });
-              } else {
-                await saveChat(chatId, { state: 'unknown', lastRunState: result.state });
-                writeSse(res, result.state === 'failed' ? 'run.failed' : 'run.unknown', { chatId });
-              }
-            } catch {
-              await saveChat(chatId, { state: 'unknown' });
-              writeSse(res, 'run.unknown', { chatId });
-            } finally { sessionRuntime.delete(chatId); req.off('aborted', abort); res.off('close', abort); if (!res.writableEnded) res.end(); }
+              } catch {
+                retireTicket();
+                await runs.transition(lease, 'unknown');
+                await saveChat(chatId, { state: 'unknown' });
+                writeSse(res, 'run.unknown', { chatId });
+              } finally { sessionRuntime.delete(chatId); req.off('aborted', abort); res.off('close', abort); if (!res.writableEnded) res.end(); }
+            } finally { runs.release(lease); }
           } finally { gateway.close?.(); activeChats.delete(chatId); }
           return;
         }
@@ -521,7 +689,7 @@ export function createBridgeServer({ fetchImpl = fetch, capability = loadCapabil
         const session = (await studioSessions()).data.find(s => s.id === id);
         if (!session) { json(res, 404, { error: { code: 'studio_session_not_found', message: 'Studio session not found' } }, origin, origins); return; }
         const key = `${documentRootId}:${session.id}`; const binding = { ...safeBinding({ id: session.id, title: session.title, documentRootId }), source:'studio', profile:'default' };
-        await mutateLegacyBindings(bindingsFile, current => ({ ...current, [key]: binding })); json(res, 200, { binding }, origin, origins); return;
+        await mutateLegacyBindings(bindingsFile, current => ({ ...current, [key]: current[key] ? { ...binding, ...current[key] } : binding })); json(res, 200, { binding }, origin, origins); return;
       }
       if (p === '/sessions' && req.method === 'GET') {
         const r = await forward('/api/sessions?source=api_server&limit=200'); const data = await r.json();
@@ -530,7 +698,7 @@ export function createBridgeServer({ fetchImpl = fetch, capability = loadCapabil
         const merged = new Map([...legacy, ...local].map(s => [s.id, s]));
         json(res, r.status, r.ok ? { ...data, data:[...merged.values()] } : data, origin, origins); return;
       }
-      if (p === '/sessions' && req.method === 'POST') { const b = await readBody(req); const title = String(b.title || '新对话'); if (!validateDocumentTitle(title)) { json(res, 400, { error: { code: 'invalid_document_title', message: 'Invalid document title' } }, origin, origins); return; } const requested = typeof b.session_id === 'string' ? b.session_id : ''; const id = requested.startsWith(`siyuan:${documentRootId}:`) ? requested : `siyuan:${documentRootId}:${crypto.randomUUID()}`; await mutateLegacyBindings(bindingsFile, current => ({ ...current, [`${documentRootId}:${id}`]: { id, title, documentRootId, updatedAt:new Date().toISOString(), source:'studio', profile:'default', pending:true } })); json(res, 200, { session:{ id, title, source:'studio', profile:'default', message_count:0, preview:'' } }, origin, origins); return; }
+      if (p === '/sessions' && req.method === 'POST') { const b = await readBody(req); const title = String(b.title || '新对话'); if (!validateDocumentTitle(title)) { json(res, 400, { error: { code: 'invalid_document_title', message: 'Invalid document title' } }, origin, origins); return; } const requested = typeof b.session_id === 'string' ? b.session_id : ''; const id = requested.startsWith(`siyuan:${documentRootId}:`) ? requested : `siyuan:${documentRootId}:${crypto.randomUUID()}`; let selected; await mutateLegacyBindings(bindingsFile, current => { selected = current[`${documentRootId}:${id}`] || { id, title, documentRootId, updatedAt:new Date().toISOString(), source:'studio', profile:'default', pending:true }; return { ...current, [`${documentRootId}:${id}`]: selected }; }); json(res, 200, { session:{ id, title:selected.title, source:'studio', profile:'default', message_count:0, preview:'' } }, origin, origins); return; }
       const m = p.match(/^\/sessions\/([^/]+)(\/messages|\/chat|\/chat\/stream)?$/);
       if (m) {
         const id = decodeURIComponent(m[1]);
@@ -538,8 +706,13 @@ export function createBridgeServer({ fetchImpl = fetch, capability = loadCapabil
         const bound = findBinding(bindings, documentRootId, id);
         if (bound?.id === id && bound.documentRootId === documentRootId && bound.profile === 'default') {
           if (m[2] === '/messages' && req.method === 'GET') { const result = await fetchStudioMessagesPaginated({ sessionId:id, fetchPage: async (offset, limit) => { const r = await studioForward(`/api/studio/sessions/conversations/${encodeURIComponent(id)}/messages/paginated?offset=${offset}&limit=${limit}`); const body = await r.json(); if (!r.ok) throw Object.assign(new Error(`Studio messages failed (${r.status})`), { status:r.status, body }); return body; } }); const normalized = normalizeStudioMessages({ messages:result.messages }, id); json(res, 200, { ...normalized, total:result.total, offset:result.offset, limit:result.limit, hasMore:false }, origin, origins); return; }
-          if (m[2] === '/chat' && req.method === 'POST') { const b=await readBody(req); const input=String(b.message||''); let text=''; const result=await studioRun({studioBase,token:studioToken,tokenProvider:tokenProvider || (() => studioToken ?? loadStudioToken()),payload:buildRunPayload({sessionId:id,input,instructions:String(b.system_message||'')}),onEvent:(event,data)=>{if(event==='message.delta')text+=String(data?.delta??data?.content??'');}}); await finalizePendingStudioSession(id); text ||= String(result?.content??result?.message?.content??''); json(res,200,{session_id:id,message:{role:'assistant',content:text}},origin,origins); return; }
-          if (m[2] === '/chat/stream' && req.method === 'POST') { const b=await readBody(req); const input=String(b.message||''); if(!input.trim()){json(res,400,{error:{code:'empty_message',message:'Message required'}},origin,origins);return;} const controller=new AbortController(); const close=()=>controller.abort(); req.on('aborted',close); res.on('close',close); res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache',Connection:'keep-alive',...corsHeaders(origin,origins)}); try { await studioRun({studioBase,token:studioToken,tokenProvider:tokenProvider || (() => studioToken ?? loadStudioToken()),payload:buildRunPayload({sessionId:id,input,instructions:String(b.system_message||'')}),signal:controller.signal,onEvent:(event,data)=>{if(!res.destroyed)res.write(`event: ${event}\ndata: ${JSON.stringify(data??{})}\n\n`);}}); await finalizePendingStudioSession(id); if(!res.writableEnded)res.end(); } catch(e) { if(!res.destroyed){res.write(`event: run.failed\ndata: ${JSON.stringify({error:String(e?.message||e)})}\n\n`);res.end();} } return; }
+          if ((m[2] === '/chat' || m[2] === '/chat/stream') && req.method === 'POST') {
+            const body = await readBody(req); const input = String(body.message || '');
+            if (!input.trim()) throw chatError(400, 'empty_message', '消息不能为空');
+            await executeStudio({ owner: { kind: 'legacy-studio', sessionId: id, documentRootId }, identity: legacyRunIdentity(bound), input,
+              instructions: String(body.system_message || ''), streaming: m[2] === '/chat/stream', finalize: () => finalizePendingStudioSession(id) });
+            return;
+          }
         }
         const sessionResponse = await forward(`/api/sessions/${upstreamId}`); const sessionData = await sessionResponse.json(); const session = sessionData?.session || sessionData;
         if (!sessionResponse.ok || !validateOwnedSession(session, documentRootId)) { json(res, 403, { error: { code: 'session_scope_denied', message: 'Session is outside document scope' } }, origin, origins); return; }
@@ -559,7 +732,7 @@ export function createBridgeServer({ fetchImpl = fetch, capability = loadCapabil
     } catch (e) {
       if (!res.headersSent) {
         const newRoute = /^\/(chats|connections|legacy-bindings)(\/|$)/.test(new URL(req.url, 'http://bridge').pathname);
-        const safe = newRoute ? safeErrors.get(e?.code) : null;
+        const safe = newRoute || ['session_busy', 'session_result_unknown', 'session_identity_unknown', 'empty_message'].includes(e?.code) ? safeErrors.get(e?.code) : null;
         json(res, safe ? safe[0] : 500, { error: { code: safe ? e.code : 'bridge_error', message: safe ? safe[1] : newRoute ? 'Bridge request failed' : e?.message || String(e) } }, origin, origins);
       } else res.destroy(e);
     }

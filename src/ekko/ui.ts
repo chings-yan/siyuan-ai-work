@@ -10,6 +10,7 @@ import { roomMessageView, type RoomMessageView } from './presentation.ts';
 import { isOwnRoomMessage, projectRoomContent, roomQuoteExcerpt } from './message-content.ts';
 
 export type RoomSourceOption = { label: string; source: SelectedRoomSource };
+export type RoomAnswerSource = { link: RoomLink; documentId: string; messageId: string; senderId: string; content: string };
 export type EkkoRoomUIOptions = {
   drafts?: Map<string, RoomDraft>;
   isCurrent?: () => boolean;
@@ -18,6 +19,7 @@ export type EkkoRoomUIOptions = {
   getBridgeIdentity?: () => string;
   onChanged?: () => void;
   onOpenLink?: (link: RoomLink) => Promise<void>;
+  onAnswerAction?: (action: 'adopt' | 'task-draft', source: RoomAnswerSource, isCurrent: () => boolean) => Promise<void>;
   openConnectionSettings?: () => void;
   client: () => Pick<EkkoBridgeClient, 'connection' | 'pair' | 'rooms' | 'room' | 'events' | 'send' | 'sendStatus'>;
   store: Pick<RoomLinkStore, 'listForWork' | 'linkRoom' | 'unlinkRoom' | 'assertLinked'> & Partial<Pick<RoomLinkStore, 'listForDocument'>>;
@@ -171,6 +173,26 @@ export class EkkoRoomUI {
 
   get activeLink(): RoomLink | null { return this.active?.link || null; }
   get isSending(): boolean { return this.sending.size>0; }
+  /** Explicit, freshly read search material uses the same room source boundary as the composer. */
+  async addReferenceSource(option: RoomSourceOption, isCurrent: () => boolean): Promise<void> {
+    const active=this.active,version=this.version;
+    if(!active||!isCurrent()||!this.allowRoomInteraction())throw Error('当前房间状态待核对，资料尚未加入');
+    const source=option.source;
+    if(source.kind!=='selection'||!/^\d{14}-[a-z0-9]{7}$/.test(source.documentId)||!/^\d{14}-[a-z0-9]{7}$/.test(source.blockId)||
+       !source.selectedText.trim()||!source.originalBlock.includes(source.selectedText))throw Error('检索引用的准确原文尚未核实');
+    const available=await this.options.availableSources(active.workId);
+    if(!isCurrent()||!this.stillCurrent(version,active)||!this.allowRoomInteraction())throw Error('页面或房间已变化，资料尚未加入');
+    if((active.workId===null&&source.documentId!==active.documentRootId)||!available.some(item=>item.source.kind==='document'&&item.source.documentId===source.documentId))throw Error('这篇文档不在当前房间的可选资料范围；请先明确关联到当前 Work');
+    this.saveVisibleDraft();
+    const draft=this.draft();if(!draft.selectedSources.some(item=>same(item,source)))draft.selectedSources.push({...source});
+    if(!active.sources.some(item=>same(item.source,source)))active.sources.push({label:option.label,source:{...source}});
+    this.render();
+  }
+  private retainSelectedSources(sources: RoomSourceOption[], draft: RoomDraft): RoomSourceOption[] {
+    const result=[...sources];
+    for(const source of draft.selectedSources)if(source.kind==='selection'&&sources.some(item=>item.source.kind==='document'&&item.source.documentId===source.documentId)&&!result.some(item=>same(item.source,source)))result.push({label:'已选精确引用',source:{...source}});
+    return result;
+  }
   connectionChanged(): void { this.rejectIdentity({code:'identity_changed'}); }
   /** Only guarded ownership preparation may retain the original room or inactive management scene. */
   retainActiveRoomAfterScopePreparation(expectedLink: RoomLink | null, documentRootId: string): void {
@@ -502,7 +524,7 @@ export class EkkoRoomUI {
     const progress: HistoryProgress = previous ? { ...previous, gap: previous.gap ? { ...previous.gap, cursors: new Set(previous.gap.cursors) } : undefined } : {
       historyAnchor: mergeMessages([], result.messages).at(-1)?.id ?? (result.hasMore ? undefined : null), olderHasMore: result.hasMore,
     };
-    const active: ActiveRoom = { workId, documentRootId, link, room: result.room, agents: result.agents, sources, hasMore: result.hasMore, ...progress };
+    const active: ActiveRoom = { workId, documentRootId, link, room: result.room, agents: result.agents, sources:this.retainSelectedSources(sources,this.draft(key)), hasMore: result.hasMore, ...progress };
     this.active = active;
     this.options.onChanged?.();
     if (!this.stillCurrent(version, active)) return;
@@ -852,6 +874,15 @@ export class EkkoRoomUI {
         roomMessageView(item, this.verifiedAgents(active))?.presentation !== 'reply' || !item.content.trim()) return;
     return { roomId: item.roomId, messageId: item.id, senderName: item.senderName ?? '', content: item.content };
   }
+  private answerFor(id: string): RoomAnswerSource | undefined {
+    const active = this.active;
+    if (!active || !validMessageId(id)) return;
+    const item = (this.histories.get(this.currentKey()) ?? []).find(message => message.id === id);
+    if (!item || item.role !== 'assistant' || typeof item.senderId !== 'string' || item.senderId.startsWith('auth:') ||
+      !this.verifiedAgents(active).some(agent => agent.agentId === item.senderId) ||
+      (Object.hasOwn(item, 'isStreaming') ? item.isStreaming !== false : item.preservesStreamingFlagPresence !== true) || !this.replyFor(id)) return;
+    return { link: { ...active.link }, documentId: active.documentRootId, messageId: id, senderId: item.senderId, content: item.content };
+  }
   private replyPreview?: { element: HTMLElement; key: string; reply: RoomReply };
   private renderReply(): void {
     const previous = this.replyPreview;
@@ -1106,6 +1137,17 @@ export class EkkoRoomUI {
     if (!this.panel.contains(target)) return;
     const id = target.dataset.ekkoId ?? '';
     switch (target.dataset.ekkoAction) {
+      case 'adopt-answer':
+      case 'draft-answer': {
+        const active = this.active, version = this.version;
+        const source = this.answerButtons.get(target);
+        if (!active || !source || !this.options.onAnswerAction) break;
+        const current = () => this.canChooseAgent(active, version) && same(source, this.answerFor(source.messageId));
+        if (!current()) { this.setStatus('原回答或房间状态已变化，请重新选择'); break; }
+        try { await this.options.onAnswerAction(target.dataset.ekkoAction === 'adopt-answer' ? 'adopt' : 'task-draft', structuredClone(source), current); }
+        catch (error) { if (this.stillCurrent(version, active)) this.setStatus(error instanceof Error ? error.message : '回答操作暂不可用'); }
+        break;
+      }
       case 'reply': {
         const active = this.active;
         if (!active || !this.allowRoomInteraction()) break;
@@ -1150,7 +1192,7 @@ export class EkkoRoomUI {
           const sources = await this.options.availableSources(active.workId);
           if (this.stillCurrent(version, active)) {
             const expanded = this.panel.querySelector<HTMLDetailsElement>('[data-ekko-source-details]')?.open ?? false;
-            this.saveVisibleDraft(); active.sources = sources; this.render();
+            this.saveVisibleDraft(); active.sources = this.retainSelectedSources(sources,this.draft()); this.render();
             const details = this.panel.querySelector<HTMLDetailsElement>('[data-ekko-source-details]');
             if (details) details.open = expanded;
           }
@@ -1310,6 +1352,7 @@ export class EkkoRoomUI {
     agentBlock.dataset.ekkoAgents = ''; return agentBlock;
   }
   private replyButtons = new WeakMap<HTMLButtonElement, RoomReply>();
+  private answerButtons = new WeakMap<HTMLButtonElement, RoomAnswerSource>();
   private messageRenderer?: MessageRenderer<RenderedRoomMessage>;
   private messageArea?: HTMLElement;
   private renderMessages(prepend=false): void {
@@ -1326,7 +1369,8 @@ export class EkkoRoomUI {
         '<details class="sac-ekko-technical" data-ekko-technical><summary>'+ (item.presentation==='tools'?'工具定义':item.presentation==='stats'?'运行统计':'工具结果')+'（展开查看原文）</summary><pre><code>'+escapeMessage(item.content).replace(/\r/g,'&#13;')+'</code></pre></details>':
         '<div class="sac-ekko-message-content">'+markdownMarkup(projected.body,doc)+'</div>'+quote;
       const reply = !item.acknowledged && this.replyFor(item.id);
-      const actions = item.presentation === 'reply' ? '<div class="sac-ekko-message-actions"><button type="button" class="sac-copy-reply" data-copy-reply>复制</button>'+(reply ? '<button type="button" data-ekko-action="reply">引用回复</button>' : '')+'</div>' : '';
+      const answer = !item.acknowledged && this.options.onAnswerAction && this.answerFor(item.id);
+      const actions = item.presentation === 'reply' ? '<div class="sac-ekko-message-actions"><button type="button" class="sac-copy-reply" data-copy-reply>复制</button>'+(reply ? '<button type="button" data-ekko-action="reply">引用回复</button>' : '')+(answer ? '<button type="button" data-ekko-action="adopt-answer">采纳</button><button type="button" data-ekko-action="draft-answer">待办草稿</button>' : '')+'</div>' : '';
       return '<article class="sac-ekko-message">'+meta+body+(item.acknowledged ? '<div class="sac-ekko-receipt-status" role="status">已发送，等待历史同步</div>' : '')+actions+'</article>';
     });}
     const agents=this.verifiedAgents(active);
@@ -1358,6 +1402,11 @@ export class EkkoRoomUI {
       const reply = this.replyFor(button.closest<HTMLElement>('[data-message-id]')?.dataset.messageId ?? '');
       button.disabled = !reply || this.sending.has(this.currentKey()) || !!this.draft().unknownId;
       if (reply) this.replyButtons.set(button, reply);
+    });
+    container.querySelectorAll<HTMLButtonElement>('[data-ekko-action="adopt-answer"], [data-ekko-action="draft-answer"]').forEach(button => {
+      const source = this.answerFor(button.closest<HTMLElement>('[data-message-id]')?.dataset.messageId ?? '');
+      button.disabled = !source || !this.canChooseAgent(active, this.version);
+      if (source) this.answerButtons.set(button, source);
     });
   }
 }

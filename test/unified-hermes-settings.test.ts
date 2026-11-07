@@ -498,7 +498,7 @@ for (const [name, view, advice] of [
             assert.doesNotMatch(f.doc.body.innerHTML, /private-upstream|private-token|private-path|private.invalid/);
             assert.match(f.label().textContent || '', /上次/);
             assert.match(f.label().textContent || '', /非实时|并非实时/);
-            assert.match(f.label().textContent || '', /重新检测.*更新/);
+            assert.match(f.label().textContent || '', /检查连接.*更新/);
             assert.doesNotMatch(f.label().textContent || '', /本次/);
             assert.deepEqual(f.counts(), { saves: 0, selections: 0, inspections: 0 });
             assert.equal(f.doc.querySelector<HTMLSelectElement>('[data-setting="hermesConnection"]')!.value, '');

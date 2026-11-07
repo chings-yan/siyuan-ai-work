@@ -1,4 +1,4 @@
-export type TaskView = { id: string; title: string; completed: boolean; documentId: string | null; projectId: string | null; createdAt: string };
+export type TaskView = { id: string; title: string; completed: boolean; documentId: string | null; projectId: string | null; createdAt: string; blockId?:string|null; customProgress?:number|null; kanbanStatus?:string|null };
 export type TaskLookup = { kind: 'found'; value: TaskView } | { kind: 'missing' } | { kind: 'unavailable'; reason: string };
 export type TaskList = {kind:'found';value:TaskView[]} | {kind:'unavailable';reason:string};
 type RpcResponse = { result?: { tools?: { name: string }[]; structuredContent?: unknown; content?: { type: string; text?: string }[] }; error?: { message?: string } };
@@ -10,14 +10,19 @@ class TaskMissingError extends Error {}
 function taskView(value: unknown): TaskView | null {
   if (!value || typeof value !== 'object') return null;
   const item = value as Record<string, unknown>;
-  if (typeof item.id !== 'string' || typeof item.title !== 'string') return null;
-  return { id: item.id, title: item.title, completed: item.completed === true, documentId: typeof item.docId === 'string' && item.docId ? item.docId : null, projectId: typeof item.projectId === 'string' && item.projectId ? item.projectId : null, createdAt: typeof item.createdAt === 'string' ? item.createdAt : '' };
+  if (typeof item.id !== 'string' || !item.id.trim() || typeof item.title !== 'string' || typeof item.completed !== 'boolean') return null;
+  if (item.blockId !== undefined && item.blockId !== null && item.blockId !== '' && (typeof item.blockId !== 'string' || !/^\d{14}-[a-z0-9]{7}$/.test(item.blockId))) return null;
+  return { id: item.id, title: item.title, completed: item.completed, documentId: typeof item.docId === 'string' && item.docId ? item.docId : null, projectId: typeof item.projectId === 'string' && item.projectId ? item.projectId : null, createdAt: typeof item.createdAt === 'string' ? item.createdAt : '',
+    ...(item.blockId !== undefined ? {blockId:item.blockId as string|null} : {}),
+    ...(item.customProgress === null || typeof item.customProgress === 'number' && Number.isFinite(item.customProgress) && item.customProgress >= 0 && item.customProgress <= 100 ? {customProgress:item.customProgress} : {}),
+    ...(item.kanbanStatus === null || typeof item.kanbanStatus === 'string' && item.kanbanStatus.trim() ? {kanbanStatus:item.kanbanStatus as string|null} : {}),
+  };
 }
 export function shouldClearCurrentTask(currentId: string | null, checkedId: string, result: TaskLookup): boolean {
   return currentId === checkedId && (result.kind === 'missing' || (result.kind === 'found' && result.value.completed));
 }
 export class NativeTaskReader {
-  constructor(private readonly transport: Transport = fetch, private readonly endpoint = '/mcp') {}
+  constructor(private readonly transport: Transport = (input, init) => globalThis.fetch(input, init), private readonly endpoint = '/mcp') {}
   private async call(action: 'search_task' | 'get_task', args: Record<string, unknown>): Promise<unknown> {
     const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 8000);
     let session = '';
@@ -53,13 +58,15 @@ export class NativeTaskReader {
       const data = await this.call('search_task', { completed: false, limit: RECENT_SCAN_LIMIT, ...(keyword?{keyword}:{}) });
       if (!Array.isArray(data)) throw new Error('任务列表格式错误');
       if (data.length >= RECENT_SCAN_LIMIT) throw new Error(keyword?'匹配任务超过 1000 条，请缩小搜索范围':'未完成任务超过 1000 条，无法可靠推荐最近任务');
-      const tasks = data.map(taskView).filter((x): x is TaskView => x !== null && !x.completed);
+      const parsed = data.map(taskView);
+      if (parsed.some(task=>task===null)) throw new Error('任务字段或完成状态格式错误，无法核对');
+      const tasks = (parsed as TaskView[]).filter(task=>!task.completed);
       tasks.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       return { kind: 'found', value: tasks.slice(0, Math.max(1, Math.min(50, limit))) };
     } catch (error) { return { kind: 'unavailable', reason: error instanceof Error ? error.message : String(error) }; }
   }
   async getTask(id: string): Promise<TaskLookup> {
-    try { const data = await this.call('get_task', { id }); const value = taskView(data); if(value&&value.id!==id)throw new Error('任务接口返回的 ID 不一致，已停止操作，请重新核对');return value ? { kind: 'found', value } : { kind: 'missing' }; }
+    try { const data = await this.call('get_task', { id }); const value = taskView(data); if(value&&value.id!==id)throw new Error('任务接口返回的 ID 不一致，已停止操作，请重新核对');if(!value)throw new Error('任务字段或完成状态格式错误，无法核对');return { kind: 'found', value }; }
     catch (error) { return error instanceof TaskMissingError ? { kind: 'missing' } : { kind: 'unavailable', reason: error instanceof Error ? error.message : String(error) }; }
   }
 }

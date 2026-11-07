@@ -1,5 +1,7 @@
 import { readFile, rename, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { assertSessionRun } from './hermes-session-run-record.mjs';
+import { assertSnapshotActive } from './hermes-history-snapshot.mjs';
 
 // Only absent ownership without exact index evidence is unresolved. Explicit
 // invalid or contradictory profiles are a separate protocol validation failure.
@@ -50,14 +52,15 @@ export async function readBindings(file) {
   try { value = JSON.parse(text); }
   catch { throw new Error('Bridge 绑定数据损坏；已停止写入，请从备份恢复'); }
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Bridge 绑定数据格式错误；已停止写入');
+  for (const [key, row] of Object.entries(value)) if (row && Object.hasOwn(row, 'run')) assertSessionRun(row.run, row, key, 'legacy');
   return value;
 }
 export async function writeBindingsAtomic(file, value) { await mkdir(dirname(file), { recursive: true }); const tmp = `${file}.${process.pid}.tmp`; const { writeFile } = await import('node:fs/promises'); await writeFile(tmp, JSON.stringify(value), { encoding:'utf8', mode:0o600 }); await rename(tmp, file); }
 
-export async function runStudioSocket({ studioBase, token, tokenProvider, payload, onEvent, signal, socketFactory, timeoutMs = 120000, abortGraceMs = 5000, maxAuthRetries = 1 }) {
+export async function runStudioSocket({ studioBase, token, tokenProvider, payload, onEvent, signal, canAbort = () => true, socketFactory, timeoutMs = 120000, abortGraceMs = 5000, maxAuthRetries = 1 }) {
   const factory = socketFactory || (await import('socket.io-client')).io;
   return await new Promise((resolve, reject) => {
-    let done = false; let socket; let timer; let abortTimer; let authRetries = 0; let aborting = false;
+    let done = false; let socket; let timer; let abortTimer; let authRetries = 0; let aborting = false; let accepted = false; let sent = false;
     const events = ['run.started','message.delta','reasoning.delta','thinking.delta','tool.started','tool.output','tool.completed','approval.requested','clarify.requested','run.completed','run.failed','abort.started','abort.completed','abort.timeout'];
     const registrations = new Map();
     const cleanupSocket = (candidate) => {
@@ -67,24 +70,75 @@ export async function runStudioSocket({ studioBase, token, tokenProvider, payloa
       candidate?.disconnect?.();
     };
     const finish = (fn, value) => { if (done) return; done = true; clearTimeout(timer); clearTimeout(abortTimer); signal?.removeEventListener('abort', abort); cleanupSocket(socket); fn(value); };
-    const abort = () => { if (done || aborting) return; aborting = true; if (socket) socket.emit('abort', {session_id:payload.session_id}); abortTimer = setTimeout(() => finish(reject, new DOMException('The operation was aborted', 'AbortError')), abortGraceMs); };
+    const abort = () => {
+      if (done || aborting) return;
+      aborting = true;
+      // Local transport cancellation is not permission to stop a shared session.
+      // The Bridge additionally requires its accepted, still-live owned lease.
+      if (!socket || !accepted || !canAbort()) { finish(reject, new DOMException('The operation was aborted', 'AbortError')); return; }
+      socket.emit('abort', {session_id:payload.session_id});
+      abortTimer = setTimeout(() => finish(reject, new DOMException('The operation was aborted', 'AbortError')), abortGraceMs);
+    };
     const isAuthError = (e) => /auth|unauthor|token|credential/i.test(String(e?.message || e?.code || ''));
     const register = (candidate, event, callback) => { registrations.set(event, callback); candidate.on(event, callback); };
     const attach = (candidate) => {
       if (done) { candidate.disconnect?.(); return; }
-      cleanupSocket(socket); socket = candidate;
-      for (const event of events) register(candidate, event, data => { onEvent?.(event, data); if (event === 'run.completed') finish(resolve, data); if (event === 'run.failed') finish(reject, new Error(String(data?.error || 'Studio run failed'))); if (event === 'abort.completed' || event === 'abort.timeout') finish(reject, new DOMException('The operation was aborted', 'AbortError')); });
-      register(candidate, 'connect', () => { if (!aborting) candidate.emit('run', payload); });
+      cleanupSocket(socket); socket = candidate; accepted = false;
+      for (const event of events) register(candidate, event, data => { if (done || candidate !== socket) return; if (event === 'run.started') { if (aborting) return; accepted = true; } if (['run.completed', 'run.failed', 'abort.completed', 'abort.timeout'].includes(event)) accepted = false; onEvent?.(event, data); if (event === 'run.completed') finish(resolve, data); if (event === 'run.failed') finish(reject, new Error(String(data?.error || 'Studio run failed'))); if (event === 'abort.completed' || event === 'abort.timeout') finish(reject, new DOMException('The operation was aborted', 'AbortError')); });
+      register(candidate, 'connect', () => {
+        if (done || aborting || candidate !== socket) return;
+        // A reconnect cannot prove the previous send was unaccepted. Keep the
+        // durable unknown barrier instead of replaying a business request.
+        if (sent) { finish(reject, new Error('Studio connection changed after send')); return; }
+        sent = true; candidate.emit('run', payload);
+      });
       register(candidate, 'connect_error', async e => {
-        if (!done && !aborting && tokenProvider && isAuthError(e) && authRetries < maxAuthRetries) { authRetries++; cleanupSocket(candidate); const current = await tokenProvider(); if (!done && !aborting) attach(factory(`${studioBase}/chat-run`, { auth:{token:current}, transports:['websocket'] })); return; }
+        if (done || candidate !== socket) return;
+        if (sent) { finish(reject, e); return; }
+        if (!aborting && tokenProvider && isAuthError(e) && authRetries < maxAuthRetries) {
+          authRetries++; accepted = false; socket = undefined; cleanupSocket(candidate);
+          try { const current = await tokenProvider(); if (!done && !aborting) attach(factory(`${studioBase}/chat-run`, { auth:{token:current}, transports:['websocket'] })); }
+          catch (error) { finish(reject, error); }
+          return;
+        }
         finish(reject, e);
       });
-      if (aborting) candidate.emit('abort', {session_id:payload.session_id});
     };
     timer = setTimeout(() => finish(reject, new Error('Studio run timed out')), timeoutMs);
     signal?.addEventListener('abort', abort, {once:true});
-    Promise.resolve(tokenProvider?.() ?? token).then(current => { if (!done) attach(factory(`${studioBase}/chat-run`, { auth:{token:current}, transports:['websocket'] })); }, reject);
+    if (signal?.aborted) abort();
+    if (done) return;
+    Promise.resolve(tokenProvider?.() ?? token).then(current => { if (!done) attach(factory(`${studioBase}/chat-run`, { auth:{token:current}, transports:['websocket'] })); }, error => finish(reject, error));
   });
+}
+
+// Separate from the compatibility display reader below: missing metadata is
+// acceptable for old display, but cannot establish a durable unread cursor.
+export async function fetchStudioMessagesSnapshot({ sessionId, profile, fetchPage, limit = 200, maxPages = 100, signal }) {
+  const fail = () => { throw Object.assign(new Error('Studio history snapshot unverified'), { code: 'history_snapshot_unverified' }); };
+  if (typeof sessionId !== 'string' || !sessionId || typeof profile !== 'string' || !profile
+    || !Number.isSafeInteger(limit) || limit <= 0 || !Number.isSafeInteger(maxPages) || maxPages <= 0) fail();
+  const records = [], ids = new Set();
+  let total, offset = 0;
+  for (let count = 0; count < maxPages; count++) {
+    assertSnapshotActive(signal);
+    const page = await fetchPage(offset, limit, signal);
+    assertSnapshotActive(signal);
+    if (!page || page.session?.id !== sessionId || page.session?.profile !== profile || !Array.isArray(page.messages)
+      || !Number.isSafeInteger(page.total) || page.total < 0 || page.offset !== offset || page.limit !== limit
+      || typeof page.hasMore !== 'boolean' || (total !== undefined && total !== page.total)
+      || page.messages.length !== Math.min(limit, page.total - offset)
+      || page.hasMore !== (offset + page.messages.length < page.total)) fail();
+    total = page.total;
+    for (const row of page.messages) {
+      if (!row || !Number.isSafeInteger(row.id) || row.id <= 0 || ids.has(row.id) || row.session_id !== sessionId
+        || !['user', 'assistant', 'system', 'tool', 'command', 'moa'].includes(row.role) || typeof row.content !== 'string') fail();
+      ids.add(row.id); records.push(row);
+    }
+    if (!page.hasMore) return { records };
+    offset += page.messages.length;
+  }
+  fail();
 }
 
 export async function fetchStudioMessagesPaginated({ sessionId, fetchPage, limit = 200, maxPages = 100 }) {

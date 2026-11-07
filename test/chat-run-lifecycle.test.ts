@@ -26,6 +26,50 @@ function pluginHarness(){
   plugin.roomViews.set(root,{leave:()=>{},dispose:()=>{}});return {plugin,root,link};
 }
 
+for(const route of ['legacy','v2'])test(`Studio ${route} completion-only output reaches the actual plugin reply and clipboard`,async()=>{
+  const {plugin,root,link}=pluginHarness();
+  Object.assign(link,{connectionId:'studio-default',adapter:'studio',state:'ready',storedSessionId:'stored-1',installId:null});
+  Object.assign(plugin.threads[0],link,{id:link.chatId,hermesSessionId:'stored-1',...(route==='legacy'?{legacyBridgeUrl:plugin.bridgeUrl}:{})});
+  root.querySelector<HTMLTextAreaElement>('textarea')!.value='synthetic question';
+  const reply='完整回复\n\n必须保留的最后一段';const copies:string[]=[];let sends=0;
+  Object.defineProperty(root.ownerDocument.defaultView!.navigator,'clipboard',{value:{writeText:async(value:string)=>{copies.push(value);}}});
+  const oldFetch=globalThis.fetch;globalThis.fetch=async(url:any,init:any)=>{
+    if(String(url).endsWith('/chat/stream')){sends++;assert.equal(init.method,'POST');return new Response(`event: run.started\ndata: {"session_id":"stored-1","run_id":"synthetic-upstream"}\n\nevent: run.completed\ndata: ${JSON.stringify({output:reply,session_id:'stored-1'})}\n\n`);}
+    assert.ok(String(url).endsWith('/chats/local-1'));return Response.json({chat:{...link,kind:'studio'}});
+  };
+  try{
+    await plugin.send(root);assert.equal(sends,1);
+    const assistant=plugin.threads[0].messages.filter((message:any)=>message.role==='assistant');
+    assert.equal(assistant.at(-1)?.content,reply);
+    assert.match(root.querySelector('.sac-message-assistant .sac-message-body')!.textContent||'',/必须保留的最后一段/);
+    root.querySelector<HTMLButtonElement>('[data-copy-reply]')!.click();await tick();
+    assert.deepEqual(copies,[reply]);assert.equal(sends,1);
+  }finally{globalThis.fetch=oldFetch;root.ownerDocument.defaultView!.close();}
+});
+
+for(const event of ['run.unknown','run.interrupted','run.queued'])test(`legacy ${event} preserves the plugin pending record and received text despite late completion`,async()=>{
+  const {plugin,root,link}=pluginHarness();
+  Object.assign(link,{connectionId:'studio-default',adapter:'studio',state:'ready',storedSessionId:'stored-1',installId:null});
+  Object.assign(plugin.threads[0],link,{id:link.chatId,hermesSessionId:'stored-1',legacyBridgeUrl:plugin.bridgeUrl});
+  root.querySelector<HTMLTextAreaElement>('textarea')!.value='synthetic question';
+  const pending:any[]=[];let sends=0,clears=0;
+  plugin.workStore.setPending=async(value:any)=>{pending.splice(0,pending.length,value);};
+  plugin.workStore.listPending=async()=>pending;
+  plugin.workStore.clearPending=async()=>{clears++;pending.length=0;};
+  const oldFetch=globalThis.fetch;globalThis.fetch=async(url:any,init:any)=>{
+    assert.equal(String(url),'http://127.0.0.1:8782/sessions/stored-1/chat/stream');assert.equal(init.method,'POST');sends++;
+    return new Response(`event: message.delta\ndata: {"delta":"已到达片段"}\n\nevent: ${event}\ndata: {}\n\nevent: message.delta\ndata: {"delta":"迟到文字"}\n\nevent: run.completed\ndata: {"output":"wrong turn"}\n\n`);
+  };
+  try{
+    await plugin.send(root);
+    assert.equal(sends,1);assert.equal(clears,0);assert.equal(pending.length,1);assert.equal(pending[0].state,'unknown');
+    const assistant=plugin.threads[0].messages.filter((message:any)=>message.role==='assistant').at(-1);
+    assert.equal(assistant.content,'已到达片段');assert.equal(assistant.status,'error');
+    assert.match(root.querySelector('.sac-message-assistant .sac-message-body')!.textContent||'',/已到达片段/);
+    assert.doesNotMatch(root.textContent||'',/迟到文字|wrong turn/);
+  }finally{globalThis.fetch=oldFetch;root.ownerDocument.defaultView!.close();}
+});
+
 test('pending Serve chat keeps draft until acceptance and sends only once',async()=>{
   const {plugin,root}=pluginHarness();const textarea=root.querySelector<HTMLTextAreaElement>('textarea')!;textarea.value='问题';
   let controller!:ReadableStreamDefaultController<Uint8Array>;let submits=0,reads=0;

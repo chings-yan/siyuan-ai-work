@@ -360,38 +360,46 @@ test('stop interrupts only while this Bridge holds an active runtime ticket', as
     const running = f.call('/chats/local-1/chat/stream', 'POST', { message: '问题' });
     for (let i = 0; i < 50 && f.fakeGateway.submitCalls === 0; i++) await new Promise(resolve => setTimeout(resolve, 2));
     assert.equal(f.fakeGateway.submitCalls, 1);
-    assert.deepEqual(await (await f.call('/chats/local-1/stop', 'POST', {})).json(), { state: 'interrupted' });
+    const response = await running;
+    const reader = response.body!.getReader();
+    const started = new TextDecoder().decode((await reader.read()).value);
+    const { runId } = JSON.parse(started.split('data: ')[1].split('\n')[0]);
+    assert.equal(typeof runId, 'string');
+    assert.deepEqual(await (await f.call('/chats/local-1/stop', 'POST', { runId })).json(), { state: 'interrupted' });
     assert.equal(f.fakeGateway.interruptCalls, 1);
     release();
-    await (await running).text();
+    while (!(await reader.read()).done) {}
     assert.deepEqual(await (await f.call('/chats/local-1/stop', 'POST', {})).json(), { state: 'not_running' });
     assert.equal(f.fakeGateway.interruptCalls, 1);
   } finally { release(); await f.close(); }
 });
 
-test('bind rejects a session claimed by another root, but accepts a retained colon Chat ID', async () => {
+test('bind shares a verified session across roots and accepts a retained colon Chat ID', async () => {
   const f = await fixture();
   try {
     const oldId = `siyuan:${ROOT}:20260923123456-1`;
     const first = await f.call('/chats/bind', 'POST', { chat_id: oldId, connection_id: 'serve-local', stored_session_id: 'stored-1', confirm: true });
     assert.equal(first.status, 200);
     assert.equal((await first.json()).chat.installId, 'install-1');
-    assert.equal((await f.call('/chats/bind', 'POST', { chat_id: 'other', connection_id: 'serve-local', stored_session_id: 'stored-1', confirm: true }, OTHER_ROOT)).status, 409);
+    assert.equal((await f.call('/chats/bind', 'POST', { chat_id: 'other', connection_id: 'serve-local', stored_session_id: 'stored-1', confirm: true }, OTHER_ROOT)).status, 200);
     for (const bad of ['bad/slash', 'bad\nline', '']) {
       assert.equal((await f.call('/chats/bind', 'POST', { chat_id: bad, connection_id: 'serve-local', stored_session_id: 'stored-1', confirm: true })).status, 400);
     }
   } finally { await f.close(); }
 });
 
-test('Studio old binding claimed by another root is rejected before any v2 or old write', async () => {
-  const f = await fixture();
+test('Studio old binding in another root remains while the verified session gains an independent entry', async () => {
+  const f = await fixture({ studioCandidate: 'existing-studio' });
   try {
     const previous = { [`${ROOT}:existing-studio`]: { id: 'existing-studio', title: 'Existing', documentRootId: ROOT, source: 'studio', profile: 'default' } };
     await writeFile(f.legacyFile, JSON.stringify(previous));
     const response = await f.call('/chats/bind', 'POST', { chat_id: 'local-1', connection_id: 'studio-default', stored_session_id: 'existing-studio', confirm: true }, OTHER_ROOT);
-    assert.equal(response.status, 409);
-    assert.deepEqual(JSON.parse(await readFile(f.legacyFile, 'utf8')), previous);
-    assert.deepEqual(await readChatBindings(f.v2File), {});
+    assert.equal(response.status, 200);
+    const old = JSON.parse(await readFile(f.legacyFile, 'utf8'));
+    assert.deepEqual(old[`${ROOT}:existing-studio`], previous[`${ROOT}:existing-studio`]);
+    assert.equal(old[`${OTHER_ROOT}:existing-studio`].documentRootId, OTHER_ROOT);
+    assert.equal((await readChatBindings(f.v2File))['local-1'].documentRootId, OTHER_ROOT);
+    assert.equal((await f.call('/chats/local-1/messages')).status, 403);
   } finally { await f.close(); }
 });
 

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 import { WorkQuickPicker } from '../src/work/quick-picker.ts';
 import { SettingsDialog } from '../src/work/settings-dialog.ts';
+import type { BridgeInspection } from '../src/work/connection-settings.ts';
 import { createChatShell } from '../src/ui.ts';
 
 const tick = () => new Promise(resolve => setTimeout(resolve, 0));
@@ -46,12 +47,14 @@ test('dock Work control opens a local menu; entering and linking are distinct ac
 test('settings uses a document modal and explains local Bridge address without shrinking chat', async () => {
   const dom = new JSDOM(`<!doctype html><body>${createChatShell()}</body>`);
   const root = dom.window.document.querySelector<HTMLElement>('.sac')!;
-  const saved: string[] = [],locations:string[]=[];
+  const saved: string[] = [],inspected:string[]=[],locations:string[]=[];
+  const inspection=(url:string):BridgeInspection=>({url,message:'只读核对完成',bridgeAuthenticated:true,hermesReady:false,connections:[],saveOutcome:'not-requested',evidence:{checkedAt:'2026-11-06T12:00:00.000Z',code:'ok',reads:[{attempt:1,step:'health',httpStatus:200},{attempt:1,step:'connections',httpStatus:200}],companion:null}});
   const dialog = new SettingsDialog(dom.window.document, {
     bridgeUrl: () => 'http://127.0.0.1:8782',
-    bridgeStatus: () => '已连接',
+    bridgeStatus: () => '已连接',pairingPresent:()=>true,
     save: async () => {assert.fail('legacy save must not bypass confirmation');},
-    connectBridge: async (input,current) => {assert.equal(current(),true);saved.push(input.url);return {url:input.url,message:'已保存',bridgeAuthenticated:true,hermesReady:false,saveOutcome:'bridge-only'};},
+    inspectBridge: async (input,current) => {assert.equal(current(),true);inspected.push(input.url);return inspection(input.url);},
+    connectBridge: async (input,current) => {assert.equal(current(),true);assert.equal(input.bridgeOnly,true);saved.push(input.url);return {...inspection(input.url),saveOutcome:'bridge-only'};},
     defaultNotebookId:()=>'',listNotebooks:async()=>[{id:'20260929120001-abcdef0',name:'工作笔记本'}],
     saveDefaultNotebook:async id=>{locations.push(id);},
   });
@@ -70,9 +73,18 @@ test('settings uses a document modal and explains local Bridge address without s
   overlay.querySelector<HTMLButtonElement>('[data-settings-action="save-location"]')!.click();await tick();
   assert.deepEqual(locations,['20260929120001-abcdef0']);
   assert.equal(root.querySelector('.sac-settings'),null,'settings content must not occupy a dock grid row');
-  overlay.querySelector<HTMLInputElement>('[data-setting="baseUrl"]')!.value='http://127.0.0.1:8783';
-  overlay.querySelector<HTMLButtonElement>('[data-settings-action="save"]')!.click();
-  await tick();
+  overlay.querySelector<HTMLButtonElement>('[data-settings-action="hermes"]')!.click();
+  const maintenance=overlay.querySelector<HTMLDetailsElement>('[data-settings-help="maintenance"]')!;
+  maintenance.querySelector<HTMLElement>('summary')!.click();assert.equal(maintenance.open,true);
+  const address=overlay.querySelector<HTMLInputElement>('[data-setting="baseUrl"]')!;address.value='http://127.0.0.1:8783';address.dispatchEvent(new dom.window.Event('input',{bubbles:true}));
+  overlay.querySelector<HTMLButtonElement>('[data-settings-action="detect-bridge"]')!.click();await tick();
+  assert.deepEqual(inspected,['http://127.0.0.1:8783']);assert.deepEqual(saved,[],'inspection must not save');
+  overlay.querySelector<HTMLButtonElement>('[data-settings-action="prepare-bridge"]')!.click();await tick();
+  assert.deepEqual(saved,[],'maintenance preparation must not save');assert.deepEqual(inspected,['http://127.0.0.1:8783']);
+  assert.equal(overlay.querySelector('[data-settings-action="save"]'),null);
+  const confirm=overlay.querySelector<HTMLButtonElement>('[data-connection-card] [data-settings-action="confirm-bridge"]')!;
+  assert.equal(overlay.querySelectorAll('[data-settings-action="confirm-bridge"]').length,1);assert.equal(confirm.textContent,'使用此连接');assert.equal(confirm.hidden,false);assert.equal(confirm.closest('[hidden]'),null);assert.equal(dom.window.document.activeElement,confirm);
+  confirm.click();await tick();
   assert.deepEqual(saved,['http://127.0.0.1:8783']);
   overlay.querySelector<HTMLButtonElement>('[data-settings-action="close"]')!.click();
   assert.equal(dom.window.document.querySelector('.sac-settings-overlay'),null);

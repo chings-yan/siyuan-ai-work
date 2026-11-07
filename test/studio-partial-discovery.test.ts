@@ -121,7 +121,11 @@ test('actual settings show partial status, detection stays read-only and only ex
   f.p.openSettings(f.root,'hermes');await tick();
   f.doc.querySelector<HTMLButtonElement>('[data-settings-action="detect-bridge"]')!.click();await tick();
   assert.equal(saves,0);assert.equal(f.p.confirmedConnectionId,undefined);assert.deepEqual(paths,['/health','/connections']);
-  assert.match(f.doc.querySelector('[data-bridge-status]')!.textContent||'',/部分.*归属.*核验/);
+  const status=f.doc.querySelector('[data-bridge-status]')!;
+  assert.match(status.textContent||'',/尚未连接/);assert.doesNotMatch(status.textContent||'',/已连接/);
+  const candidate=f.doc.querySelector<HTMLElement>('[data-connection-candidate]')!,candidateStatus=candidate.querySelector<HTMLElement>('[data-candidate-status]')!;
+  assert.equal(candidate.hidden,false);assert.equal(candidateStatus.closest('[hidden]'),null);
+  assert.ok(candidateStatus.textContent?.includes('部分会话归属尚未核验，无法关联；已核验归属的会话可继续使用。'));
   assert.match(f.doc.querySelector('[data-hermes-results]')!.textContent||'',/无法关联/);
   f.doc.querySelector<HTMLButtonElement>('[data-settings-action="view-diagnostic"]')!.click();
   const preview=f.doc.querySelector('[data-diagnostic-preview]')!.textContent!;
@@ -130,6 +134,9 @@ test('actual settings show partial status, detection stays read-only and only ex
   f.doc.querySelector<HTMLButtonElement>('[data-settings-action="copy-diagnostic"]')!.click();await tick();assert.equal(copied,preview);
   f.doc.querySelector<HTMLButtonElement>('[data-settings-action="confirm-bridge"]')!.click();await tick();
   assert.equal(saves,1);assert.equal(f.p.confirmedConnectionId,'studio-default');assert.equal(f.p.activeThreadId,active);assert.equal(f.input.value,'原 Chat 草稿');
+  assert.match(status.textContent||'',/已连接.*会话读取正常/);
+  const notice=f.doc.querySelector<HTMLElement>('[data-session-notice]')!;
+  assert.equal(notice.hidden,false);assert.equal(notice.closest('[hidden]'),null);assert.match(notice.textContent||'',/部分会话.*不可关联.*已核验.*可继续使用/);
  }finally{globalThis.fetch=original;f.p.settingsDialog?.dispose();f.close();}
 });
 

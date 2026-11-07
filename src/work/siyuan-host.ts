@@ -1,6 +1,7 @@
-import { isValidDocumentRootId } from '../core.ts';
+import { isValidDocumentRootId, normalizeForReadback } from '../core.ts';
 import type { WorkHost } from './service.ts';
 import type { ExistingDocument, Notebook } from './create.ts';
+import { assertWorkTemplateSnapshot, type WorkTemplateSnapshot } from './templates.ts';
 
 export type SiYuanApi = (path: string, body: Record<string, unknown>) => Promise<unknown>;
 function row(value: unknown): Record<string, unknown> | null { return Array.isArray(value) && value[0] && typeof value[0] === 'object' ? value[0] as Record<string, unknown> : null; }
@@ -107,12 +108,53 @@ export class SiYuanWorkHost implements WorkHost {
     if (!Array.isArray(value) || value.some(id => !isValidDocumentRootId(id))) throw new Error('同名文档检查返回格式错误');
     return value;
   }
-  async createDocument(notebook: string, title: string, operation: string): Promise<string> {
+  async createDocument(notebook: string, title: string, operation: string, template?: WorkTemplateSnapshot): Promise<string> {
     requireId(notebook);
     if (!/^work-create:[a-f0-9-]+$/u.test(operation)) throw new Error('无效的创建操作标记');
-    const value = await this.creationRead(this.api('/api/filetree/createDocWithMd', {notebook,path:`/${title}`,markdown:`Work 创建记录\n{: custom-ai-work-create-op="${operation}"}`}));
+    if (template !== undefined) assertWorkTemplateSnapshot(template);
+    const markdown = `Work 创建记录\n{: custom-ai-work-create-op="${operation}"}` + (template ? `\n\n${template.markdown}` : '');
+    const value = await this.creationRead(this.api('/api/filetree/createDocWithMd', {notebook,path:`/${title}`,markdown}));
     if (!isValidDocumentRootId(value)) throw new Error('原生创建未返回有效文档 ID，结果未知');
     return value;
+  }
+  async verifyCreatedTemplate(documentId: string, notebook: string, operation: string, template: WorkTemplateSnapshot): Promise<void> {
+    requireId(documentId); requireId(notebook); assertWorkTemplateSnapshot(template);
+    if (!/^work-create:[a-f0-9-]+$/u.test(operation)) throw new Error('无效的创建操作标记');
+    const expected = ['Work 创建记录', ...template.markdown.split('\n\n')];
+    const readIdentity = async (id: string) => {
+      const value = await this.creationRead(this.api('/api/block/getBlockInfo', { id }));
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('模板文档身份读取不完整');
+      const info = value as Record<string, unknown>, path = info.path;
+      if (info.rootID !== documentId || info.box !== notebook || typeof path !== 'string' ||
+          !path.startsWith('/') || !path.endsWith(`/${documentId}.sy`) || !path.slice(1, -3).split('/').every(isValidDocumentRootId))
+        throw new Error('模板块与创建文档身份不一致');
+      return path;
+    };
+    const readChildren = async () => {
+      const children = await this.creationRead(this.api('/api/block/getChildBlocks', { id: documentId }));
+      if (!Array.isArray(children) || children.length !== expected.length || children.some(child => !isValidDocumentRootId(child?.id)))
+        throw new Error('模板正文未完整读回，请稍后核对');
+      const ids: string[] = children.map(child => child.id);
+      if (new Set(ids).size !== ids.length || ids.includes(documentId)) throw new Error('模板子块身份重复或冲突');
+      return ids;
+    };
+    const documentPath = await readIdentity(documentId), ids = await readChildren();
+    // These templates contain only flat headings/paragraphs. Read every expected
+    // block from the native tree; a creation receipt or SQL index is not body proof.
+    for (const [index, id] of ids.entries()) {
+      if (await readIdentity(id) !== documentPath) throw new Error('模板文档位置已变化，请重新核对');
+      const attrs = await this.creationRead(this.getAttrs(id));
+      if (index === 0 ? attrs['custom-ai-work-create-op'] !== operation : attrs['custom-ai-work-create-op'] !== undefined)
+        throw new Error('模板创建标记与原操作不一致');
+      const value = await this.creationRead(this.api('/api/block/getBlockKramdown', { id }));
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('模板正文读取格式错误');
+      const block = value as Record<string, unknown>;
+      if (block.id !== id || typeof block.kramdown !== 'string' || normalizeForReadback(block.kramdown) !== expected[index])
+        throw new Error('模板正文或块身份尚未完整核验');
+    }
+    // A changed tree during the bounded read stays pending, never triggers repair.
+    if (await readIdentity(documentId) !== documentPath || JSON.stringify(await readChildren()) !== JSON.stringify(ids))
+      throw new Error('模板文档在核验期间发生变化，请重新核对');
   }
   async findCreatedDocuments(notebook: string, operation: string): Promise<string[]> {
     requireId(notebook);

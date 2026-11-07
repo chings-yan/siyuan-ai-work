@@ -38,7 +38,8 @@ test('Stop waits for Studio abort confirmation before settling and cleans up onc
   const socket = { on(event:string, cb:Function){(listeners.get(event) ?? (listeners.set(event,new Set()),listeners.get(event)!)).add(cb);return this;}, off(event:string, cb:Function){listeners.get(event)?.delete(cb);return this;}, removeAllListeners(){for(const set of listeners.values())set.clear();return this;}, emit(event:string,data:unknown){emitted.push([event,data]);return this;}, disconnect(){emitted.push(['disconnect',undefined]);} };
   const controller = new AbortController();
   const promise = runStudioSocket({ studioBase:'http://studio', token:'t', payload:{session_id:'s'}, socketFactory:()=>socket, signal:controller.signal, timeoutMs:1000 });
-  listeners.get('connect')?.forEach(cb=>cb()); controller.abort();
+  await new Promise(r=>setImmediate(r));
+  listeners.get('connect')?.forEach(cb=>cb()); listeners.get('run.started')?.forEach(cb=>cb({})); controller.abort();
   let settled = false; promise.then(()=>{settled=true},()=>{settled=true}); await new Promise(r=>setImmediate(r));
   assert.equal(settled,false); assert.equal(emitted.filter(([e])=>e==='abort').length,1);
   listeners.get('abort.completed')?.forEach(cb=>cb({})); await assert.rejects(promise, (e:any)=>e.name==='AbortError');
@@ -53,4 +54,78 @@ test('Studio paginated messages aggregate formal offset pages in order and dedup
 
 test('Studio pagination has a bounded max-page guard', async () => {
   await assert.rejects(() => fetchStudioMessagesPaginated({ sessionId:'s', limit:1, maxPages:2, fetchPage: async (offset:number, limit:number) => ({messages:[{id:String(offset),role:'user',content:'x'}],total:99,offset,limit,hasMore:true}) }), /maximum page limit/);
+});
+
+// A session-level abort before this socket has accepted a run can stop another owner.
+for (const stage of ['token', 'connect', 'sent', 'expired', 'terminal', 'already-aborted']) test(`Studio cancellation at ${stage} never emits an unowned abort`, async () => {
+  const listeners = new Map<string, Function>(), emitted: string[] = [];
+  let releaseToken!: (value: string) => void;
+  const token = new Promise<string>(yes => { releaseToken = yes; });
+  const socket = { on(event: string, cb: Function) { listeners.set(event, cb); }, off() {}, removeAllListeners() {}, disconnect() {}, emit(event: string) { emitted.push(event); } };
+  const controller = new AbortController();
+  if (stage === 'already-aborted') controller.abort();
+  const promise = runStudioSocket({ studioBase: 'http://synthetic.invalid', tokenProvider: () => token, payload: { session_id: 'synthetic-shared-session' }, socketFactory: () => socket, signal: controller.signal, canAbort: () => stage !== 'expired', timeoutMs: 1000, abortGraceMs: 20 });
+  const outcome = promise.then(() => 'completed', (error: Error) => error.name);
+  if (stage !== 'token') { releaseToken('synthetic'); await new Promise(r => setImmediate(r)); }
+  if (['sent', 'expired', 'terminal'].includes(stage)) listeners.get('connect')?.();
+  if (['expired', 'terminal'].includes(stage)) listeners.get('run.started')?.({});
+  if (stage === 'terminal') listeners.get('run.completed')?.({});
+  controller.abort();
+  releaseToken('synthetic');
+  await outcome;
+  // Saved callbacks model a delayed transport callback after local cleanup.
+  listeners.get('connect')?.(); listeners.get('run.started')?.({}); controller.abort();
+  assert.equal(emitted.filter(event => event === 'abort').length, 0);
+  assert.equal(emitted.filter(event => event === 'run').length, ['sent', 'expired', 'terminal'].includes(stage) ? 1 : 0);
+});
+
+test('Studio auth failure retires the old accepted socket without a delayed reattachment', async () => {
+  const listeners = new Map<string, Function>(), emitted: string[] = [];
+  let release!: (token: string) => void, reads = 0;
+  const token = new Promise<string>(yes => { release = yes; });
+  const socket = { on(event: string, cb: Function) { listeners.set(event, cb); }, off() {}, removeAllListeners() {}, disconnect() {}, emit(event: string) { emitted.push(event); } };
+  const controller = new AbortController();
+  const result = runStudioSocket({ studioBase: 'http://synthetic.invalid', tokenProvider: () => ++reads === 1 ? 'synthetic' : token, payload: { session_id: 's' }, socketFactory: () => socket, signal: controller.signal, abortGraceMs: 20 }).catch((error: Error) => error.name);
+  await new Promise(r => setImmediate(r));
+  listeners.get('connect')?.(); listeners.get('run.started')?.({});
+  const retry = listeners.get('connect_error')?.(new Error('synthetic token expired'));
+  listeners.get('run.started')?.({}); // stale callback from the detached transport
+  controller.abort(); release('synthetic-new'); await retry; await result;
+  assert.equal(emitted.filter(event => event === 'abort').length, 0);
+  assert.equal(emitted.filter(event => event === 'run').length, 1);
+});
+
+for (const stage of ['auth-sent', 'auth-accepted', 'reconnect-sent', 'reconnect-accepted', 'auth-preparing']) test(`Studio ${stage} never replays an emitted run`, async () => {
+  const listeners = new Map<string, Function>(), emitted: string[] = [];
+  let tokenReads = 0;
+  const socket = { on(event: string, cb: Function) { listeners.set(event, cb); }, off() {}, removeAllListeners() {}, disconnect() {}, emit(event: string) { emitted.push(event); } };
+  const controller = new AbortController();
+  const outcome = runStudioSocket({ studioBase: 'http://synthetic.invalid', tokenProvider: () => { tokenReads++; return 'synthetic'; }, payload: { session_id: 's' }, socketFactory: () => socket, signal: controller.signal, abortGraceMs: 20 }).then(() => 'complete', (error: Error) => error.name);
+  await new Promise(r => setImmediate(r));
+  if (stage !== 'auth-preparing') listeners.get('connect')?.();
+  if (stage.endsWith('accepted')) listeners.get('run.started')?.({});
+  if (stage.startsWith('auth-')) await listeners.get('connect_error')?.(new Error('synthetic token expired'));
+  listeners.get('connect')?.();
+  if (stage === 'auth-preparing') { listeners.get('run.started')?.({}); listeners.get('run.completed')?.({}); }
+  controller.abort(); await outcome;
+  assert.equal(emitted.filter(event => event === 'run').length, 1);
+  assert.equal(emitted.filter(event => event === 'abort').length, 0);
+  assert.equal(tokenReads, stage === 'auth-preparing' ? 2 : 1);
+});
+
+for (const outcome of ['failed', 'late']) test(`Studio preparation token refresh ${outcome} settles without reviving transport`, async () => {
+  const listeners = new Map<string, Function>(), emitted: string[] = [];
+  let reads = 0, sockets = 0, release!: (value: string) => void;
+  const refresh = new Promise<string>(yes => { release = yes; });
+  const socket = { on(event: string, cb: Function) { listeners.set(event, cb); }, off() {}, removeAllListeners() {}, disconnect() {}, emit(event: string) { emitted.push(event); } };
+  const controller = new AbortController();
+  const result = runStudioSocket({ studioBase: 'http://synthetic.invalid', tokenProvider: () => { if (++reads === 1) return 'synthetic'; return outcome === 'failed' ? Promise.reject(new Error('synthetic refresh read failed')) : refresh; }, payload: { session_id: 's' }, socketFactory: () => { sockets++; return socket; }, signal: controller.signal }).then(() => 'complete', (error: Error) => error.message);
+  try {
+    await new Promise(r => setImmediate(r));
+    const retry = listeners.get('connect_error')?.(new Error('synthetic token expired'));
+    if (outcome === 'late') { controller.abort(); release('synthetic-new'); }
+    await assert.doesNotReject(async () => await retry);
+    assert.match(await result, outcome === 'failed' ? /refresh read failed/ : /aborted/);
+    assert.equal(sockets, 1); assert.deepEqual(emitted, []);
+  } finally { controller.abort(); release('synthetic-new'); await result; }
 });

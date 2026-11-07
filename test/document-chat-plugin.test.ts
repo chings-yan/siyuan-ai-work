@@ -9,6 +9,95 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type ServerResponse } from 'node:http';
 
+test('observed reply activity is local and acknowledgement never clears durable send evidence',async()=>{
+ const f=await fixture();try{
+  await f.p.startNewChat(f.root);f.draft('虚构动态问题');await f.p.send(f.root);
+  const tray=f.root.querySelector('[data-reply-activity]');assert.ok(tray,'observed replies need an activity entry');
+  assert.match(tray.textContent!,/新回复待查看/);
+  const chatId=f.p.activeThreadId;
+  await f.p.workStore.setPending({id:`chat-run:${chatId}`,kind:'chat',workId:null,state:'unknown',details:'synthetic pending',updatedAt:'2026-11-06T00:00:00Z'});
+  (tray.querySelector('[data-activity-action="ack"]') as HTMLButtonElement).click();
+  assert.match(tray.textContent!,/回复已查看/);assert.equal((await f.p.workStore.listPending()).length,1);
+  const before=f.calls.length;f.p.renderReplyActivities();assert.equal(f.calls.length,before,'activity rendering must not fetch or send');
+ }finally{f.close();}
+});
+test('running reply activity survives a second view and completes without changing its draft',async()=>{
+ const f=await fixture();try{
+  await f.p.startNewChat(f.root);f.delay.stream=gate();f.draft('虚构运行');const sending=f.p.send(f.root);await until(()=>f.calls.some(c=>c.path.endsWith('/chat/stream')));
+  const second=f.dom.window.document.createElement('div');f.dom.window.document.body.append(second);f.p.render(second);
+  assert.match(second.querySelector('[data-reply-activity]')?.textContent||'',/等待回复/);
+  const input=second.querySelector('textarea')!;input.value='保留草稿';input.dispatchEvent(new f.dom.window.Event('input',{bubbles:true}));
+  f.delay.stream.release();await sending;
+  assert.match(second.querySelector('[data-reply-activity]')?.textContent||'',/新回复待查看/);
+  assert.match(second.querySelector('[data-messages]')?.textContent||'',/虚构回复/);assert.equal(input.value,'保留草稿');assert.equal(second.querySelector('[data-action="send-stop"]')?.getAttribute('aria-label'),'发送');
+ }finally{f.close();}
+});
+
+test('reply activity opens exact observed chat without acknowledgement or another send',async()=>{
+ const f=await fixture();try{await f.p.startNewChat(f.root);f.draft('虚构问题');await f.p.send(f.root);const row=f.p.replyActivities.list(f.p.connectionIdentity())[0],before=f.calls.length;
+  await f.p.openReplyActivity(f.root,row);assert.equal(f.p.activeThreadId,row.target.link.chatId);assert.equal(f.p.replyActivities.list(f.p.connectionIdentity())[0].acknowledged,false);assert.equal(f.calls.length,before);
+  f.data.get('work-formal-v2').chats.find((link:any)=>link.chatId===row.target.link.chatId).profile='changed-profile';
+  await assert.rejects(f.p.openReplyActivity(f.root,row),/关系|身份/);assert.equal(f.calls.length,before);
+ }finally{f.close();}
+});
+test('reply activity returns to original document and preserves the other document draft',async()=>{
+ const f=await fixture();try{f.enableNavigation();await f.p.startNewChat(f.root);f.draft('原文档问题');await f.p.send(f.root);const row=f.p.replyActivities.list(f.p.connectionIdentity())[0];
+  await f.navigate(B);f.draft('另一文档草稿');await f.p.openReplyActivity(f.root,row);
+  assert.equal(f.p.activeThreadId,row.target.link.chatId);assert.deepEqual(f.openedDocuments,[A]);
+  await f.navigate(B);assert.equal(f.input.value,'另一文档草稿');assert.equal(f.calls.filter(c=>c.path.endsWith('/chat/stream')).length,1);
+ }finally{f.close();}
+});
+
+for(const mode of ['empty','queued','identity-mismatch'] as const)test('reply activity keeps '+mode+' result for review without retry',async()=>{
+ const f=await fixture();let sending:Promise<void>|undefined;try{await f.p.startNewChat(f.root);f.draft('需要核对');
+  if(mode==='empty')f.setReplyText('');if(mode==='queued')f.setQueued();if(mode==='identity-mismatch')f.delay.stream=gate();
+  sending=f.p.send(f.root);if(mode==='identity-mismatch'){await until(()=>f.calls.some(c=>c.path.endsWith('/chat/stream')));f.setMismatch();f.delay.stream!.release();}await sending;
+  const row=f.p.replyActivities.list(f.p.connectionIdentity())[0];assert.equal(row.state,'review');const pending=await f.p.workStore.listPending();
+  f.p.replyActivities.acknowledge(row.key,row.revision);assert.deepEqual(await f.p.workStore.listPending(),pending);assert.equal(f.calls.filter(c=>c.path.endsWith('/chat/stream')).length,1);
+ }finally{f.delay.stream?.release();await sending;f.close();}
+});
+
+async function proposalFixture(){
+ const f=await fixture();await f.p.startNewChat(f.root);let text='原文',writes=0;const control={writeGate:null as ReturnType<typeof gate>|null,readGate:null as ReturnType<typeof gate>|null,readMismatch:false,onWrite:async()=>{}};
+ f.p.pendingProposal={threadId:f.p.activeThreadId,chatRootId:A,targetDocumentId:A,items:[{blockId:'20261106000000-ddddddd',expectedOriginal:'原文',replacement:'建议原文'}]};
+ f.p.workHost.getDocumentRoot=async()=>A;
+ f.p.readBlockMarkdown=async()=>{await control.readGate?.promise;return control.readMismatch?'原文':text;};
+ const api=f.p.api;f.p.api=async(path:string,body:any)=>{if(path!=='/api/block/updateBlock')return api(path,body);writes++;await control.onWrite();await control.writeGate?.promise;text=body.data;return {};};
+ f.p.renderProposal(f.root);return {...f,control,get writes(){return writes;}};
+}
+test('proposal acceptance persists intent before writing and blocks duplicate panels',async()=>{
+ const f=await proposalFixture();let running:Promise<void>|undefined,duplicate:Promise<void>|undefined;try{
+  const second=f.dom.window.document.createElement('div');f.dom.window.document.body.append(second);f.p.render(second);f.control.writeGate=gate();
+  let fenced=false;f.control.onWrite=async()=>{fenced=(await f.p.workStore.listPending()).some((item:any)=>item.kind==='write');};
+  running=f.p.accept(f.root);await until(()=>f.writes===1);duplicate=f.p.accept(second);await tick();
+  assert.equal(f.writes,1);assert.equal(fenced,true);assert.equal(second.querySelector<HTMLButtonElement>('[data-accept-proposal]')?.disabled,true);
+  second.querySelector<HTMLButtonElement>('[data-reject-proposal]')?.click();assert.ok(f.p.pendingProposal);
+  f.control.writeGate.release();await running;assert.equal(f.p.pendingProposal,null);assert.equal((await f.p.workStore.listPending()).length,0);
+ }finally{f.control.writeGate?.release();await running;await duplicate;f.close();}
+});
+for(const mode of ['storage-failure','existing-intent'] as const)test('proposal acceptance stops before writes on '+mode,async()=>{
+ const f=await proposalFixture();try{
+  const marker={id:`write:${f.p.activeThreadId}:${A}`,kind:'write',workId:null,state:'unknown',details:'已有未决',updatedAt:'2026-11-06T00:00:00Z'};
+  if(mode==='existing-intent')await f.p.workStore.setPending(marker);else{const save=f.p.saveData;f.p.saveData=async(key:string,value:any)=>{if(key==='work-pending-v1')throw Error('synthetic save failure');return save(key,value);};}
+  await f.p.accept(f.root);assert.equal(f.writes,0);assert.ok(f.p.pendingProposal);
+  if(mode==='existing-intent')assert.deepEqual(await f.p.workStore.listPending(),[marker]);
+ }finally{f.close();}
+});
+test('proposal acceptance rechecks original scene after asynchronous preflight',async()=>{
+ const f=await proposalFixture();let running:Promise<void>|undefined;try{f.control.readGate=gate();running=f.p.accept(f.root);await tick();f.setBackgroundEditor(B);f.control.readGate.release();await running;assert.equal(f.writes,0);assert.equal((await f.p.workStore.listPending()).length,0);}
+ finally{f.control.readGate?.release();await running;f.close();}
+});
+test('proposal readback mismatch retains a durable blocker and prevents retry',async()=>{
+ const f=await proposalFixture();try{f.control.readMismatch=true;await f.p.accept(f.root);assert.equal(f.writes,1);assert.equal(f.p.proposalNeedsReview,true);assert.equal((await f.p.workStore.listPending()).length,1);await f.p.accept(f.root);assert.equal(f.writes,1);}
+ finally{f.close();}
+});
+test('proposal success cannot clear a replacement pending marker',async()=>{
+ const f=await proposalFixture();try{const marker={id:`write:${f.p.activeThreadId}:${A}`,kind:'write',workId:null,state:'unknown',details:'较新未决',updatedAt:'2026-11-06T00:00:01Z'};
+  f.control.onWrite=async()=>{await f.p.workStore.setPending(marker);};await f.p.accept(f.root);
+  assert.equal(f.writes,1);assert.deepEqual(await f.p.workStore.listPending(),[marker]);assert.equal(f.p.proposalNeedsReview,true);
+ }finally{f.close();}
+});
+
 const A='20261012120000-aaaaaaa', B='20261012120001-bbbbbbb', W='20261012120002-ccccccc';
 const temp=mkdtempSync(join(tmpdir(),'document-chat-plugin-'));
 const bundle=join(temp,'index.cjs');
@@ -26,7 +115,7 @@ async function fixture(data=new Map<string,any>(),earlyDraft=''){
  const original=(Module as any)._load;
  (Module as any)._load=function(request:string,parent:any,isMain:boolean){if(request==='siyuan')return {Plugin:class{app=app;},getAllEditor:()=>[editor],openTab:async(input:any)=>{if(!navigation.open)assert.fail('document Chat must not navigate');const id=input.doc.id;openedDocuments.push(id);await navigation.open(id);}};return original.call(this,request,parent,isMain);};
  let C:any;try{const require=createRequire(import.meta.url);delete require.cache[require.resolve(bundle)];C=require(bundle).default;}finally{(Module as any)._load=original;}
- const p:any=new C();p.loadData=async(key:string)=>data.get(key);p.saveData=async(key:string,value:any)=>data.set(key,structuredClone(value));
+ const p:any=new C();p.loadData=async(key:string)=>data.get(key);p.saveData=async(key:string,value:any)=>data.set(key,structuredClone(value));p.workflowStorage={loadData:(key:string)=>p.loadData(key),saveData:(key:string,value:any)=>p.saveData(key,value)};
  const paths=new Map([[A,`/${A}.sy`],[B,`/${B}.sy`],[W,`/${W}.sy`]]),marks=new Set<string>();let readError='';
  // Stub only SiYuan's API port; controller, host, WorkService and WorkStore stay real.
  p.api=async(path:string,body:any)=>{
@@ -46,7 +135,9 @@ async function fixture(data=new Map<string,any>(),earlyDraft=''){
  const roomStreams=new Map<string,ServerResponse[]>();
  const chats=new Map<string,any>(),calls:{path:string;doc:string;body:any}[]=[];
  const delay={create:null as ReturnType<typeof gate>|null,bind:null as ReturnType<typeof gate>|null,history:null as ReturnType<typeof gate>|null,stream:null as ReturnType<typeof gate>|null};
- let unknownCreate=false,unknownBind=false,queued=false,mismatch=false;
+ let unknownCreate=false,unknownBind=false,queued=false,mismatch=false,shared=false,rejection='',rejectionStatus=409,replyText='虚构回复';
+ let snapshotRows=[{id:'1',role:'assistant',content:'虚构已有正文'}];
+ let ticket:string|undefined='11111111-1111-4111-8111-111111111111';
  const json=(res:ServerResponse,value:any)=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify(value));};
  const server=createServer(async(req,res)=>{
   let text='';for await(const chunk of req)text+=chunk;
@@ -57,7 +148,8 @@ async function fixture(data=new Map<string,any>(),earlyDraft=''){
   if(path.startsWith('/ekko/rooms/')&&path.includes('/send-status/'))return json(res,{state:'unknown'});
   if(path.startsWith('/ekko/rooms/')&&path.endsWith('/messages'))return json(res,{state:'unknown'});
   if(path.startsWith('/ekko/rooms/'))return json(res,{room:{id:path.split('/')[3].split('?')[0],name:'虚构房间'},messages:[],agents:[{roomId:path.split('/')[3].split('?')[0],agentId:'fictional-agent',name:'虚构助手'}],hasMore:false});
-  if(path==='/connections')return json(res,{data:[connection]});
+  if(path==='/connections')return json(res,{data:[connection],...(shared?{meta:{schemaVersion:1,bridgeVersion:null,capabilities:['hermes-shared-session-v1']}}:{})});
+  if(path.startsWith('/chats?'))return json(res,{data:[...chats.values()].filter(c=>c.documentRootId===doc&&c.connectionId===new URL(path,'http://synthetic').searchParams.get('connection_id'))});
   if(path==='/connections/serve-local/sessions'||path==='/connections/serve-other/sessions')return json(res,{data:[{id:'remote-existing',title:'虚构已有对话'}]});
   if(path==='/chats'||path==='/chats/bind'){
    await (path==='/chats'?delay.create?.promise:delay.bind?.promise);
@@ -66,11 +158,14 @@ async function fixture(data=new Map<string,any>(),earlyDraft=''){
    chats.set(chat.chatId,chat);return json(res,{chat});
   }
   const id=path.split('/')[2],chat=chats.get(id);
+  if(path.endsWith('/stop'))return json(res,{state:'unknown'});
   if(path.endsWith('/chat/stream')){
-   res.setHeader('Content-Type','text/event-stream');res.write('event: run.started\ndata: {"userRowId":12}\n\n');await delay.stream?.promise;
+   if(rejection){await delay.stream?.promise;res.statusCode=rejectionStatus;return json(res,{error:{code:rejection}});}
+   res.setHeader('Content-Type','text/event-stream');res.write('event: run.started\ndata: '+JSON.stringify({userRowId:12,...(ticket?{runId:ticket}:{})})+'\n\n');await delay.stream?.promise;
    if(queued)res.end('event: run.queued\ndata: {}\n\n');
-   else{chat.state='ready';chat.storedSessionId ||= 'remote-'+id;res.end('event: run.completed\ndata: {"text":"虚构回复"}\n\n');}return;
+   else{chat.state='ready';chat.storedSessionId ||= 'remote-'+id;res.end('event: run.completed\ndata: '+JSON.stringify({text:replyText})+'\n\n');}return;
   }
+  if(path.endsWith('/messages/snapshot'))return json(res,{snapshot:{schemaVersion:1,complete:true,completeness:'display-history',consistency:'two-complete-reads-match',source:{chatId:chat.chatId,documentRootId:chat.documentRootId,connectionId:chat.connectionId,kind:chat.kind,profile:chat.profile,installId:chat.installId,storedSessionId:chat.storedSessionId},messages:snapshotRows}});
   if(path.endsWith('/messages')){await delay.history?.promise;return json(res,{data:[{role:'assistant',content:'虚构历史 '+doc}]});}
   if(chat)return json(res,{chat:mismatch?{...chat,installId:'other-install'}:chat});
   res.statusCode=404;json(res,{});
@@ -85,7 +180,7 @@ async function fixture(data=new Map<string,any>(),earlyDraft=''){
  p.bridgeToken='fictional-token';p.connectionViews=[connection];p.confirmedConnectionId='serve-local';p.connectionOk=true;
  await p.onWorkChanged(null);
  const input=root.querySelector<HTMLTextAreaElement>('[data-composer] textarea')!;
- return {p,root,input,dom,data,chats,calls,delay,paths,marks,roomStreams,openedDocuments,navigation,setBackgroundEditor:(id:string)=>{active=id;editor.protyle.block.rootID=id;},enableNavigation(){navigation.open=async(id:string)=>{active=id;editor.protyle.block.rootID=id;await p.workController.refreshFromEditor();};},emitRoom:(id:string,content:string)=>roomStreams.get(id)?.at(-1)?.write('event: room.message\ndata: '+JSON.stringify({id:'synthetic-event-'+content,roomId:id,content,timestamp:'2026-10-13T00:00:00Z'})+'\n\n'),setReadError:(v:string)=>readError=v,setUnknownCreate:()=>unknownCreate=true,setUnknownBind:()=>unknownBind=true,setQueued:()=>queued=true,setMismatch:()=>mismatch=true,
+ return {p,root,input,dom,data,chats,calls,delay,paths,marks,roomStreams,openedDocuments,navigation,setSnapshotRows:(rows:typeof snapshotRows)=>snapshotRows=rows,setBackgroundEditor:(id:string)=>{active=id;editor.protyle.block.rootID=id;},enableNavigation(){navigation.open=async(id:string)=>{active=id;editor.protyle.block.rootID=id;await p.workController.refreshFromEditor();};},emitRoom:(id:string,content:string)=>roomStreams.get(id)?.at(-1)?.write('event: room.message\ndata: '+JSON.stringify({id:'synthetic-event-'+content,roomId:id,content,timestamp:'2026-10-13T00:00:00Z'})+'\n\n'),setShared:()=>shared=true,setReplyText:(value:string)=>replyText=value,setRejection:(code:string,status=409)=>{rejection=code;rejectionStatus=status;},setTicket:(value:string|undefined)=>ticket=value,setReadError:(v:string)=>readError=v,setUnknownCreate:()=>unknownCreate=true,setUnknownBind:()=>unknownBind=true,setQueued:()=>queued=true,setMismatch:()=>mismatch=true,
   async navigate(id:string){active=id;editor.protyle.block.rootID=id;await p.workController.refreshDocument(id);},
   async bind(){await p.associateStudio(root);const radio=dom.window.document.querySelector<HTMLInputElement>('[data-studio-options] input');assert.ok(radio,'standalone document must offer candidates');radio.dispatchEvent(new dom.window.Event('change'));return (dom.window.document.querySelector<HTMLButtonElement>('[data-studio-confirm]')!.onclick as any)();},
   draft(text:string){input.value=text;input.dispatchEvent(new dom.window.Event('input',{bubbles:true}));},
@@ -608,4 +703,138 @@ test('same-document navigation never silently adopts a replaced Bridge with iden
   assert.match(f.root.querySelector('[data-ekko-composer-state]')?.textContent||'',/页面.*变化/);
   assert.equal(f.root.querySelector('[data-ekko-composer]'),input);assert.equal(input.value,'原连接草稿');assert.equal(f.calls.filter(x=>x.path.endsWith('/messages')&&x.doc).length,0);
  }finally{f.p.closeRoomAssociation?.();f.close();}
+});
+
+for(const code of ['session_busy','session_result_unknown','session_identity_unknown'])test('shared pre-accept refusal preserves draft and retires only its own intent '+code,async()=>{
+ const f=await fixture();try{await f.bind();const chat=(await f.p.workStore.listDocumentChats(A))[0];await f.p.selectChat(f.root,chat.chatId);f.draft('B 独立草稿');f.setRejection(code);await f.p.send(f.root);assert.equal(f.input.value,'B 独立草稿');assert.deepEqual(await f.p.workStore.listPending(),[]);assert.match(f.root.querySelector('[data-status]')!.textContent||'',code==='session_busy'?/这段对话正在处理/:/待核对/);assert.equal(f.p.threads.find((t:any)=>t.id===chat.chatId).messages.filter((m:any)=>m.role==='user').length,0);}finally{f.close();}
+});
+for(const outcome of ['unrecognized','server-error','transport'])test('ambiguous rejection keeps durable intent '+outcome,async()=>{
+ const f=await fixture();try{await f.bind();const chat=(await f.p.workStore.listDocumentChats(A))[0];await f.p.selectChat(f.root,chat.chatId);f.draft('保持草稿');f.setRejection(outcome==='unrecognized'?'other_conflict':'session_busy',outcome==='server-error'?503:409);const savedFetch=globalThis.fetch;if(outcome==='transport')globalThis.fetch=async(url,init)=>String(url).endsWith('/chat/stream')?Promise.reject(Error('synthetic lost reply')):savedFetch(url,init);try{await f.p.send(f.root);}finally{globalThis.fetch=savedFetch;}assert.ok((await f.p.workStore.listPending()).some((r:any)=>r.id==='chat-run:'+chat.chatId));assert.equal(f.input.value,'保持草稿');}finally{f.close();}
+});
+test('delayed shared refusal cannot clear a replacement pending record or overwrite another scene',async()=>{
+ const f=await fixture(),wait=gate();let sending:Promise<void>|undefined;try{await f.bind();const chat=(await f.p.workStore.listDocumentChats(A))[0];await f.p.selectChat(f.root,chat.chatId);f.draft('原草稿');f.setRejection('session_busy');f.delay.stream=wait;sending=f.p.send(f.root);await until(()=>f.calls.some(c=>c.path.endsWith('/chat/stream')));const newer={id:'chat-run:'+chat.chatId,kind:'chat',workId:null,state:'unknown',details:'newer protected attempt',updatedAt:'2026-11-06T10:00:00Z'};await f.p.workStore.setPending(newer);await f.navigate(B);f.draft('B 场景');f.p.setStatus(f.root,'B 原提示');wait.release();await sending;assert.deepEqual((await f.p.workStore.listPending()).find((r:any)=>r.id===newer.id),newer);assert.equal(f.input.value,'B 场景');assert.equal(f.root.querySelector('[data-status]')!.textContent,'B 原提示');}finally{wait.release();await sending;f.close();}
+});
+test('original run.started ticket is sent for owner stop and never reused by the next attempt',async()=>{
+ const f=await fixture(),wait=gate();let sending:Promise<void>|undefined;try{await f.bind();const chat=(await f.p.workStore.listDocumentChats(A))[0];await f.p.selectChat(f.root,chat.chatId);f.draft('first');f.delay.stream=wait;sending=f.p.send(f.root);await until(()=>f.p.activeRunBridge?.runId);await f.p.stopCurrentRun(f.root);assert.equal(f.calls.find(c=>c.path.endsWith('/stop'))?.body.runId,'11111111-1111-4111-8111-111111111111');wait.release();await sending;assert.equal(f.p.activeRunBridge,undefined);
+ f.setTicket(undefined);const second=gate();f.delay.stream=second;f.draft('second');sending=f.p.send(f.root);await until(()=>f.calls.filter(c=>c.path.endsWith('/chat/stream')).length===2);await tick();await f.p.stopCurrentRun(f.root);assert.ok(!f.calls.filter(c=>c.path.endsWith('/stop')).at(-1)?.body.runId);second.release();await sending;
+ }finally{wait.release();f.delay.stream?.release();await sending;f.close();}
+});
+
+for(const sameWork of [true,false])test(`shared remote session retains independent local Chat drafts references pins and materials across ${sameWork?'one Work children':'separate Works'}`,async()=>{
+ const f=await fixture();try{
+  f.setShared();if(sameWork){f.paths.set(A,`/${W}/${A}.sy`);f.paths.set(B,`/${W}/${B}.sy`);f.marks.add(W);}else{f.marks.add(A);f.marks.add(B);}
+  await f.navigate(A);await f.p.syncHermesSessions();await f.bind();const first=(await f.p.workStore.listChats(sameWork?W:A)).find((l:any)=>l.documentRootId===A);assert.ok(first);await f.p.selectChat(f.root,first.chatId);f.draft('A 独立草稿');
+  f.p.references.add({id:'shared-ref-a',blockId:A,documentRootId:A,documentTitle:'虚构 A',selectedText:'虚构选择',expectedOriginal:'虚构选择',capturedBlockKramdown:'虚构选择',createdAt:'',startOffset:null,endOffset:null});f.p.workController.restoreContext({mode:'selection',documentIds:[A]});await tick();const mode=f.root.querySelector<HTMLInputElement>('[data-context-mode][value=selection]')!;mode.checked=true;mode.dispatchEvent(new f.dom.window.Event('change',{bubbles:true}));const context=f.p.workController.contextChoice;
+  await f.p.workStore.setPins(first.chatId,[{documentId:A,blockId:null,kind:'document'}]);await f.navigate(B);await f.p.workController.flushResume();const priorResumes=await f.p.workStore.listResume();const resumeBeforeBind=structuredClone(f.data.get('work-resume-v1'));await f.bind();assert.deepEqual(f.data.get('work-resume-v1'),resumeBeforeBind,'association must preserve original Work-keyed Resume');const second=(await f.p.workStore.listChats(sameWork?W:B)).find((l:any)=>l.documentRootId===B);assert.ok(second);assert.notEqual(first.chatId,second.chatId);assert.equal(first.storedSessionId,second.storedSessionId);assert.equal(first.workId,sameWork?W:A);assert.equal(second.workId,sameWork?W:B);
+  await f.p.selectChat(f.root,second.chatId);await f.p.workController.flushResume();const resumeB=await f.p.workStore.getResume(sameWork?W:B);assert.equal(resumeB.workId,sameWork?W:B);assert.equal(resumeB.documentId,B);assert.equal(resumeB.chatId,second.chatId);assert.equal(f.data.get('work-resume-v1').schema,1);assert.deepEqual(Object.keys(f.data.get('work-resume-v1').items).sort(),sameWork?[W]:[A,B].sort());if(!sameWork)assert.deepEqual(await f.p.workStore.getResume(A),priorResumes.find((r:any)=>r.workId===A));assert.equal(f.input.value,'');assert.equal(f.p.references.list().length,0);assert.deepEqual(await f.p.workStore.getPins(second.chatId),[]);f.draft('B 独立草稿');
+  if(!sameWork)await f.navigate(A);await f.p.selectChat(f.root,first.chatId);assert.equal(f.input.value,'A 独立草稿');assert.equal(f.p.references.list()[0].id,'shared-ref-a');assert.deepEqual(f.p.workController.contextChoice,context);assert.deepEqual(await f.p.workStore.getPins(first.chatId),[{documentId:A,blockId:null,kind:'document'}]);await f.p.workController.flushResume();assert.equal((await f.p.workStore.getResume(sameWork?W:A)).chatId,first.chatId);if(!sameWork)assert.equal((await f.p.workStore.getResume(B)).chatId,second.chatId);assert.equal(f.calls.filter(c=>c.path.endsWith('/chat/stream')).length,0);
+ }finally{f.close();}
+});
+
+test('activity review regression: delayed activity open must not supersede a newer same-document Chat choice',async()=>{
+ const f=await fixture();let opening:Promise<unknown>|undefined;const hold=gate();try{
+  await f.p.startNewChat(f.root);f.draft('original');await f.p.send(f.root);
+  const row=f.p.replyActivities.list(f.p.connectionIdentity())[0];
+  await f.p.startNewChat(f.root);const second=f.p.activeThreadId;await f.p.startNewChat(f.root);const newer=f.p.activeThreadId;await f.p.selectChat(f.root,second);
+  const original=f.p.workStore.chatLink.bind(f.p.workStore);let held=false;
+  f.p.workStore.chatLink=async(id:string)=>{const result=await original(id);if(!held){held=true;await hold.promise;}return result;};
+  opening=f.p.openReplyActivity(f.root,row).catch((error:Error)=>error);
+  await until(()=>held);await f.p.selectChat(f.root,newer);assert.notEqual(newer,second);f.draft('newer draft');
+  hold.release();await opening;
+  assert.equal(f.p.activeThreadId,newer,'late activity read must not replace newer Chat selection');
+ }finally{hold.release();await opening;f.close();}
+});
+test('activity review regression: activity open must refuse substituted local legacy source',async()=>{
+ const f=await fixture();try{
+  await f.p.startNewChat(f.root);f.draft('original');await f.p.send(f.root);
+  const row=f.p.replyActivities.list(f.p.connectionIdentity())[0];await f.p.startNewChat(f.root);
+  const formal=f.data.get('work-formal-v2').chats.find((link:any)=>link.chatId===row.target.link.chatId);const thread=f.p.threads.find((thread:any)=>thread.id===row.target.link.chatId);const source={adapter:'studio',connectionId:'studio-default',installId:null};Object.assign(formal,source);Object.assign(row.target.link,source);Object.assign(thread,source,{legacyBridgeUrl:f.p.bridgeUrl+'/substituted'});
+  let reads=0;f.p.loadThreadMessages=async()=>{reads++;return true;};
+  const outcome=await f.p.openReplyActivity(f.root,row).catch((error:Error)=>error);
+  assert.equal(reads,0,'substituted source must fail before any history read');assert.ok(outcome instanceof Error);
+ }finally{f.close();}
+});
+
+test('activity review regression: completed reply survives disposed originating root with cleared contents',async()=>{
+ const f=await fixture();let sending:Promise<unknown>|undefined;try{
+  await f.p.startNewChat(f.root);f.delay.stream=gate();f.draft('original');sending=f.p.send(f.root);await until(()=>f.calls.some(c=>c.path.endsWith('/chat/stream')));
+  const second=f.dom.window.document.createElement('div');f.dom.window.document.body.append(second);f.p.render(second);
+  f.p.disposeRoomView(f.root);f.root.replaceChildren();f.root.remove();
+  f.delay.stream.release();await sending;
+  assert.equal(f.p.replyActivities.list(f.p.connectionIdentity())[0].state,'unread','verified complete reply must not become review only because old view was destroyed');
+  assert.match(second.querySelector('[data-messages]')?.textContent||'',/虚构回复/);
+ }finally{f.delay.stream?.release();await sending;f.close();}
+});
+
+test('full iteration knowledge tab mounts without sending and references exact current source into the original draft',async()=>{
+ const f=await fixture();try{const native=f.p.api;f.p.api=async(path:string,body:any)=>path==='/api/block/getBlockInfo'?{id:body.id,rootID:A,box:W,path:`/${A}.sy`}:path==='/api/block/getBlockKramdown'?{id:body.id,kramdown:'精确虚构原文'}:native(path,body);
+  f.draft('保留未发送消息');const before=f.calls.length;f.root.querySelector<HTMLButtonElement>('[data-dock-tab="knowledge"]')!.click();
+  assert.ok(f.root.querySelector('[data-knowledge-panel] input'));assert.equal(f.p.knowledgePanels.size,1);
+  const scope=await f.p.getKnowledgeScope('current');assert.equal(scope.kind,'documents');assert.equal(scope.documents[0].rootId,A);assert.equal(scope.documents[0].box,W);
+  await f.p.addKnowledgeReference(f.root,{id:W,rootId:A,box:W,path:`/${A}.sy`,title:'虚构来源',snippet:'截断片段',markdown:'精确虚构原文'},()=>true);
+  assert.equal(f.p.references.list()[0].selectedText,'精确虚构原文');assert.equal(f.input.value,'保留未发送消息');assert.equal(f.calls.length,before);
+ }finally{f.close();}
+});
+test('full iteration knowledge scope refuses changed document metadata and stale add callbacks',async()=>{
+ const f=await fixture();try{let release!:(v:any)=>void;f.p.api=async()=>new Promise(r=>release=r);const reading=f.p.getKnowledgeScope('current');await until(()=>!!release);f.setBackgroundEditor(B);release({rootID:A,box:W,path:`/${A}.sy`});await assert.rejects(reading,/变化/);
+  await assert.rejects(f.p.addKnowledgeReference(f.root,{id:W,rootId:A,box:W,path:`/${A}.sy`,title:'虚构',snippet:'',markdown:'原文'},()=>false),/变化/);assert.equal(f.p.references.list().length,0);
+ }finally{f.close();}
+});
+test('full iteration reply checks require exact authenticated capability and never issue legacy history reads',async()=>{
+ const f=await fixture();try{await f.bind();const link=await f.p.workStore.chatLink(f.p.activeThreadId),before=f.calls.length;
+  await assert.rejects(f.p.readReplySnapshot(link,new AbortController().signal),/配套|快照/);assert.equal(f.calls.length,before);
+  assert.ok(f.root.querySelector('[data-reply-sync]'));assert.equal(f.p.replySync.view().autoCheck,false);
+ }finally{f.close();}
+});
+
+test('full iteration ordinary completed answer opens editable task draft with zero native mutation',async()=>{
+ const f=await fixture();try{await f.p.startNewChat(f.root);f.draft('虚构任务问题');await f.p.send(f.root);const before=f.calls.length;
+  const button=f.root.querySelector<HTMLButtonElement>('[data-message-action="task-draft"]');assert.ok(button);button.click();await until(()=>!!f.dom.window.document.querySelector('[data-task-draft]'));
+  assert.match(f.dom.window.document.querySelector('[data-task-draft]')!.textContent||'',/原.*任务|任务.*原/);assert.equal(f.calls.length,before);
+ }finally{f.close();}
+});
+test('full iteration aborted Work scope cannot issue a later metadata request after a stalled compound host read',async()=>{
+ const f=await fixture();try{f.p.workController.workId=W;let release!:(v:any)=>void;const requests:string[]=[];f.p.api=async(_path:string,body:any)=>{requests.push(body.stmt||'attrs');return new Promise(r=>release=r);};const abort=new AbortController();const reading=f.p.getKnowledgeScope('work',abort.signal);await until(()=>!!release);abort.abort();await assert.rejects(reading);release([{path:`/${W}.sy`}]);await tick();assert.equal(requests.length,1);
+ }finally{f.close();}
+});
+test('full iteration adoption previews the immutable completed answer and refuses later document switch before write',async()=>{
+ const f=await fixture();try{await f.p.startNewChat(f.root);f.draft('采纳虚构问题');await f.p.send(f.root);let source:any,writes=0;
+  f.p.answerAdoption={isBusy:false,pending:async()=>[],prepare:async(s:any,t:any)=>{source=s;return {operationId:'fictional-preview',preview:s.content,target:t,mode:'formatted'};},commit:async()=>{writes++;return {state:'complete',message:'已完成'};}};
+  f.root.querySelector<HTMLButtonElement>('[data-message-action="adopt"]')!.click();await until(()=>!!f.dom.window.document.querySelector('[data-adoption-action="prepare"]'));
+  f.dom.window.document.querySelector<HTMLButtonElement>('[data-adoption-action="prepare"]')!.click();await until(()=>!!f.dom.window.document.querySelector('[data-adoption-action="confirm"]'));
+  assert.equal(source.content,'虚构回复');assert.equal(source.messageId,undefined,'local streaming IDs never pretend to be remote IDs');assert.doesNotMatch(source.conversationKey,/fictional-token/);assert.equal(writes,0);
+  f.setBackgroundEditor(B);f.dom.window.document.querySelector<HTMLButtonElement>('[data-adoption-action="confirm"]')!.click();await tick();assert.equal(writes,0);assert.match(f.dom.window.document.querySelector('[data-answer-adoption]')!.textContent||'',/变化/);
+ }finally{f.close();}
+});
+test('full iteration linked reply check uses read-only snapshots, shares view state and preserves drafts and pending',async()=>{
+ const f=await fixture();try{await f.bind();f.p.companionEvidence={url:f.p.bridgeUrl,token:f.p.bridgeToken,metadata:{schemaVersion:1,bridgeVersion:null,capabilities:['hermes-history-snapshot-v1']}};
+  f.draft('保留原草稿');const formal=structuredClone(f.data.get('work-formal-v2'));await f.p.workStore.setPending({id:'unrelated-pending',kind:'write',workId:null,state:'unknown',details:'原待核对',updatedAt:'2026-11-06T00:00:00Z'});const pending=structuredClone(await f.p.workStore.listPending()),before=f.calls.length;
+  await f.p.replySync.check();let row=f.p.replySync.view().rows[0];assert.equal(row.status,'baseline-unset');assert.equal(row.unreadCount,null);assert.equal(f.calls.slice(before).filter(c=>c.path.endsWith('/messages')).length,0);assert.equal(f.data.has('hermes-read-state-v1'),false);
+  assert.equal(await f.p.replySync.markRead(row.key,row.revision),true);f.setSnapshotRows([{id:'1',role:'assistant',content:'虚构已有正文'},{id:'2',role:'assistant',content:'虚构新回复'}]);await f.p.replySync.check();row=f.p.replySync.view().rows[0];assert.equal(row.unreadCount,1);
+  const second=f.dom.window.document.createElement('div');f.dom.window.document.body.append(second);f.p.render(second);assert.match(second.querySelector('[data-reply-sync]')!.textContent||'',/1.*回复|回复.*1/);f.p.disposeRoomView(second);assert.equal(f.p.replySync.view().rows[0].unreadCount,1);
+  assert.equal(f.input.value,'保留原草稿');assert.deepEqual(f.data.get('work-formal-v2'),formal);assert.deepEqual(await f.p.workStore.listPending(),pending);assert.equal(f.calls.filter(c=>c.path.endsWith('/chat/stream')).length,0);
+ }finally{f.close();}
+});
+test('full iteration task draft cannot mistake an old native task window for opening the new source',async()=>{
+ const f=await fixture();try{await f.p.startNewChat(f.root);f.draft('虚构问题');await f.p.send(f.root);let calls=0;f.p.nativeTaskAdapter.getState=()=>({kind:'opened',target:{documentId:B},reason:'旧表单'});f.p.nativeTaskAdapter.open=async()=>{calls++;return {kind:'opened',target:{documentId:B}};};
+  f.root.querySelector<HTMLButtonElement>('[data-message-action="task-draft"]')!.click();await until(()=>!!f.dom.window.document.querySelector('[data-task-draft-action="open-native"]'));f.dom.window.document.querySelector<HTMLButtonElement>('[data-task-draft-action="open-native"]')!.click();await until(()=>/本次未重新打开/.test(f.dom.window.document.querySelector('[data-task-draft]')!.textContent||''));assert.equal(calls,0);
+ }finally{f.close();}
+});
+test('full iteration pending adoption has an explicit read-only entry without any current answer',async()=>{
+ const f=await fixture();try{let reviews=0;f.p.answerAdoption={isBusy:false,pending:async()=>[{operationId:'prior-operation',target:{title:'原采纳文档'}}],review:async()=>{reviews++;return {state:'unknown',message:'仍需核对'};}};const before=f.calls.length;f.root.querySelector<HTMLButtonElement>('[data-action="review-adoption"]')!.click();await until(()=>!!f.dom.window.document.querySelector('[data-adoption-action="review"]'));f.dom.window.document.querySelector<HTMLButtonElement>('[data-adoption-action="review"]')!.click();await until(()=>reviews===1);assert.equal(f.calls.length,before);assert.equal(f.dom.window.document.querySelector('[data-adoption-action="confirm"]'),null);
+ }finally{f.close();}
+});
+
+test('full iteration room ordinary answer uses exact message workflow and retains original room draft without send',async()=>{
+ const f=await fixture();try{const overlay=await associateEkko(f);overlay.querySelector<HTMLButtonElement>('[data-ekko-action="open"]')!.click();await until(()=>!overlay.isConnected&&!!f.root.querySelector('[data-ekko-composer]'));await until(()=>!!f.roomStreams.get('room-a')?.length);
+  const composer=f.root.querySelector<HTMLTextAreaElement>('[data-ekko-composer]')!;composer.value='独立房间草稿';composer.dispatchEvent(new f.dom.window.Event('input',{bubbles:true}));
+  const message={id:'fictional-complete-answer',roomId:'room-a',senderId:'fictional-agent',senderName:'虚构助手',role:'assistant',content:'- [ ] 虚构待办',preservesStreamingFlagPresence:true,timestamp:'2026-11-06T00:00:00Z'};
+  f.roomStreams.get('room-a')!.at(-1)!.write('event: room.message\ndata: '+JSON.stringify(message)+'\n\n');await until(()=>!!f.root.querySelector('[data-ekko-action="adopt-answer"]'));
+  f.root.querySelector<HTMLButtonElement>('[data-ekko-action="draft-answer"]')!.click();await until(()=>!!f.dom.window.document.querySelector('[data-task-draft]'));
+  assert.match(f.dom.window.document.querySelector('[data-task-draft]')?.textContent||'',/待办/);f.p.taskDraftPanels.get(f.root).close();let source:any,writes=0;
+  f.p.answerAdoption={isBusy:false,pending:async()=>[],prepare:async(s:any,t:any)=>{source=s;return {operationId:'fixture',preview:s.content,target:t,mode:'formatted'};},commit:async()=>{writes++;return {state:'complete',message:'done'};}};
+  f.root.querySelector<HTMLButtonElement>('[data-ekko-action="adopt-answer"]')!.click();await until(()=>!!f.dom.window.document.querySelector('[data-adoption-action="prepare"]'));f.dom.window.document.querySelector<HTMLButtonElement>('[data-adoption-action="prepare"]')!.click();await until(()=>!!f.dom.window.document.querySelector('[data-adoption-action="confirm"]'));
+  assert.equal(source.messageId,message.id);assert.equal(source.content,message.content);assert.equal(source.documentId,A);assert.doesNotMatch(source.conversationKey,/fictional-token/);assert.match(source.conversationKey,/ekko-answer-v1/);
+  f.roomStreams.get('room-a')!.at(-1)!.write('event: room.message\ndata: '+JSON.stringify({...message,content:'修订回答'})+'\n\n');await until(()=>f.root.querySelector('[data-ekko-messages]')?.textContent?.includes('修订回答')===true);f.dom.window.document.querySelector<HTMLButtonElement>('[data-adoption-action="confirm"]')!.click();await tick();assert.equal(writes,0);assert.match(f.dom.window.document.querySelector('[data-answer-adoption]')?.textContent||'',/变化/);assert.equal(composer.value,'独立房间草稿');assert.equal(f.calls.filter(c=>c.path.endsWith('/messages')&&c.doc).length,0);
+ }finally{f.close();}
 });

@@ -18,7 +18,7 @@ const slash = value => value.split(sep).join('/');
 async function optionalStat(path) {
   try { return await lstat(path); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
-async function readProjectLicense(root, pkg) {
+export async function readProjectLicense(root, pkg) {
   // Historical unlicensed fixtures retain their original distribution contract.
   if (pkg.license === undefined) return null;
   if (pkg.license !== 'AGPL-3.0-only') throw new Error('Project license must be AGPL-3.0-only');

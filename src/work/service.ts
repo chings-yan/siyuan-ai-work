@@ -108,18 +108,23 @@ export class WorkService {
     if (!(await this.readWork(workId))) return [];
     return (await this.roleBlocks(workId, 'external-ref')).map(x => x.attrs['custom-ai-work-document-id']).filter(isValidDocumentRootId);
   }
-  async linkExternalDocument(workId: string, documentId: string, approved: boolean): Promise<void> {
-    const next = this.externalLinks.then(() => this.writeExternalDocumentLink(workId,documentId,approved));
+  async linkExternalDocument(workId: string, documentId: string, approved: boolean, checkCurrent:()=>void=()=>{}, validateTarget?:()=>Promise<void>): Promise<void> {
+    const next = this.externalLinks.then(() => this.writeExternalDocumentLink(workId,documentId,approved,checkCurrent,validateTarget));
     this.externalLinks = next.catch(() => undefined);
     await next;
   }
-  private async writeExternalDocumentLink(workId: string, documentId: string, approved: boolean): Promise<void> {
+  private async writeExternalDocumentLink(workId: string, documentId: string, approved: boolean, checkCurrent:()=>void, validateTarget?:()=>Promise<void>): Promise<void> {
+    checkCurrent();
     if (!approved) throw new Error('请先确认关联资料');
     if (!isValidDocumentRootId(documentId)) throw new Error('需要有效文档 ID');
     if (!(await this.readWork(workId))) throw new Error('Work 不存在');
+    checkCurrent();
     if (!(await this.host.getDocumentPath(documentId))) throw new Error('关联文档不存在或无法读取');
+    checkCurrent();
     if ((await this.listExternalDocuments(workId)).includes(documentId)) return;
     const title = (await this.host.getDocumentTitle(documentId)).replace(/["\n\r]/g, ' ').trim();
+    checkCurrent();
+    await validateTarget?.();checkCurrent();
     await this.host.appendMarkdown(workId, `**关联资料**：((${documentId} "${title}"))\n{: custom-ai-work-role="external-ref" custom-ai-work-document-id="${documentId}"}`);
     if (!(await this.listExternalDocuments(workId)).includes(documentId)) throw new Error('关联资料未能读回；请核对文档后再试');
   }

@@ -15,7 +15,7 @@ async function readJson(url:string,headers:Record<string,string>,fetcher:typeof 
   const data=await response.json().catch(()=>undefined);checkInspectionCurrent(isCurrent);return {response,data};
  })()]);checkInspectionCurrent(isCurrent);return result;}finally{clearTimeout(timer);}
 }
-export type BridgeSettingsInput={url:string;token:string;detect:boolean;connectionId?:string};
+export type BridgeSettingsInput={url:string;token:string;detect:boolean;connectionId?:string;bridgeOnly?:boolean};
 function checkInspectionCurrent(isCurrent:()=>boolean):void{if(!isCurrent())throw Object.assign(Error('文档、连接偏好或操作状态已变化，请重新检测'),{saveOutcome:'stale'});}
 export type BridgeInspection={url:string;message:string;hermesReady:boolean;bridgeAuthenticated:boolean;connections?:ConnectionView[];selectedConnectionId?:string;requiresSelection?:boolean;evidence?:InspectionEvidence;saveOutcome?:SaveOutcome};
 const INSPECTION_ERRORS={invalid_address:'Bridge 地址无效，请填写本机 Bridge 地址',health_unreachable:'本机 Bridge 未响应，请启动 Bridge 后再检测',health_invalid:'这个地址未通过思源 AI Work Bridge 健康核对'};

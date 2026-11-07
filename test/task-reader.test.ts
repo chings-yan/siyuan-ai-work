@@ -86,3 +86,38 @@ test('未完成任务超过可核对数量时，不把截断列表称为最近�
   assert.equal(result.kind, 'unavailable');
   if (result.kind === 'unavailable') assert.match(result.reason, /无法可靠推荐/);
 });
+
+function responseReader(data:unknown) {
+  return new NativeTaskReader(async(_url,init)=>{
+    const body=JSON.parse(String(init?.body));
+    const result=body.method==='tools/list'?{tools:[{name:'plugin__siyuan_plugin_task_note_management__task__fixture'}]}:body.method==='tools/call'?{structuredContent:{success:true,data}}:{};
+    return new Response(JSON.stringify({result}),{status:200});
+  });
+}
+for(const completed of [undefined,null,0,'false','true'])test(`非法完成标记 ${String(completed)} 不清当前引用`,async()=>{
+  const result=await responseReader({id:'exact',title:'虚构任务',completed}).getTask('exact');
+  assert.equal(result.kind,'unavailable');assert.equal(shouldClearCurrentTask('exact','exact',result),false);
+});
+test('合法原始块与独立进度保留，未提供的可选字段不补默认值',async()=>{
+  const result=await responseReader({id:'exact',title:'虚构任务',completed:false,blockId:'20261105120000-aaaaaaa',customProgress:37,kanbanStatus:'opaque-native-status'}).getTask('exact');
+  assert.equal(result.kind,'found');if(result.kind!=='found')return;
+  assert.equal(result.value.blockId,'20261105120000-aaaaaaa');assert.equal(result.value.customProgress,37);assert.equal(result.value.kanbanStatus,'opaque-native-status');
+  const bare=await responseReader({id:'exact',title:'虚构任务',completed:false}).getTask('exact');
+  assert.equal(bare.kind,'found');if(bare.kind==='found')assert.equal(Object.hasOwn(bare.value,'customProgress'),false);
+});
+test('畸形块不可伪造无绑定任务；非法进度与状态不展示',async()=>{
+  const malformed=await responseReader({id:'exact',title:'虚构任务',completed:false,blockId:{id:'unsafe'}}).getTask('exact');assert.equal(malformed.kind,'unavailable');
+  for(const customProgress of [-1,101,'50']){
+    const result=await responseReader({id:'exact',title:'虚构任务',completed:false,customProgress,kanbanStatus:42}).getTask('exact');
+    assert.equal(result.kind,'found');if(result.kind==='found'){assert.equal(Object.hasOwn(result.value,'customProgress'),false);assert.equal(Object.hasOwn(result.value,'kanbanStatus'),false);}
+  }
+});
+test('搜索遇到非法完成状态明确不可读取，不把未知推荐为未完成',async()=>{
+  const result=await responseReader([{id:'exact',title:'未知状态'}]).listRecent();assert.equal(result.kind,'unavailable');
+});
+
+test('default native fetch preserves its host receiver without changing injected transports',async()=>{
+ const prior=globalThis.fetch;let calls=0;
+ globalThis.fetch=async function(input,init){assert.equal(this,globalThis);assert.equal(input,'/mcp');calls++;const body=JSON.parse(String(init?.body));return new Response(JSON.stringify({result:body.method==='tools/list'?{tools:[{name:'plugin__siyuan_plugin_task_note_management__task__synthetic'}]}:body.method==='tools/call'?{structuredContent:{success:true,data:[]}}:{}}),{status:200,headers:{'Content-Type':'application/json'}});};
+ try{assert.deepEqual(await new NativeTaskReader().listRecent(),{kind:'found',value:[]});assert.equal(calls,3);}finally{globalThis.fetch=prior;}
+});

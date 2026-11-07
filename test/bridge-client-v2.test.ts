@@ -15,6 +15,8 @@ async function mockBridge() {
     seen.push({ path: req.url || '', token: req.headers['x-siyuan-collab-token'] as string | undefined, root: req.headers['x-siyuan-document-root'] as string | undefined, body: raw ? JSON.parse(raw) : null });
     if (req.url === '/connections') { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ data: [{ id: 'serve-local', kind: 'serve', displayName: 'Hermes Serve', state: 'ready', profile: 'default', installId: 'install-1' }] })); return; }
     if (req.url === '/connections/serve-local/sessions') { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ data: [{ id: 'stored-1', title: 'A' }] })); return; }
+    if (req.url === '/chats?connection_id=serve-local') { res.setHeader('Content-Type','application/json');res.end(JSON.stringify({data:[]}));return; }
+    if (req.url === '/chats/local-1/status') { res.setHeader('Content-Type','application/json');res.end(JSON.stringify({chatId:'local-1',state:'ready',lastRunState:null,run:{state:'streaming',isOwner:false,runId:'foreign-ticket'}}));return; }
     if (req.url === '/legacy-bindings') { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ data: [] })); return; }
     if (req.url === '/chats' || req.url === '/chats/bind') { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ chat: { chatId: 'local-1', connectionId: 'serve-local', kind: 'serve', profile: 'default', documentRootId: ROOT, title: 'A', state: 'pending', storedSessionId: null, installId: 'install-1' } })); return; }
     if (req.url === '/chats/local-1/messages') { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ data: [{ id: 'row-1', role: 'user', content: '问' }] })); return; }
@@ -104,4 +106,23 @@ test('history uses original Bridge and stored ID for confirmed legacy chats, loc
     assert.equal(await readThreadMessages({ ...oldThread, adapter: 'unresolved', state: 'source-unknown' }, config), null);
     assert.equal(requests.length, 2);
   } finally { globalThis.fetch = oldFetch; }
+});
+
+for(const [code,reason] of [['session_claimed',/该会话已有其他关联/],['chat_conflict',/Chat 标识.*绑定/],['connection_changed',/连接配置已变化/],['constructor',/HTTP 409/],['__proto__',/HTTP 409/],['toString',/HTTP 409/],['unrecognized-private-code',/HTTP 409/]] as const)test(`binding refusal ${code} exposes a safe client message`,async()=>{
+ const oldFetch=globalThis.fetch;
+ globalThis.fetch=async()=>Response.json({error:{code,message:'<p>secret upstream body</p>'}},{status:409});
+ try{
+  const client=createBridgeClient({bridgeUrl:'http://127.0.0.1:8782',capabilityToken:CAP},ROOT);
+  await assert.rejects(client.bindChat('fictional-chat','serve-local','fictional-session','fictional-title'),(error:unknown)=>{
+   assert.ok(error instanceof BridgeError);assert.equal(error.status,409);assert.match(error.message,reason);
+   assert.doesNotMatch(error.message,/secret upstream body|属于其他文档|未写入|function Object|object Object/);return true;
+  });
+ }finally{globalThis.fetch=oldFetch;}
+});
+
+test('current-root list filter and typed status never acquire a stop ticket from another entrance',async()=>{
+ const mock=await mockBridge();try{
+  const client=createBridgeClient({bridgeUrl:mock.url,capabilityToken:CAP},ROOT);assert.deepEqual(await client.listChats('serve-local'),{data:[]});const status=await client.statusForChat('local-1');assert.equal(status.run?.state,'streaming');assert.equal(status.run?.isOwner,false);
+  await client.stopChat('local-1');assert.deepEqual(mock.seen.at(-1)?.body,{});await client.stopChat('local-1','original-ticket');assert.deepEqual(mock.seen.at(-1)?.body,{runId:'original-ticket'});assert.ok(mock.seen.every(r=>r.root===ROOT&&r.token===CAP));
+ }finally{await mock.close();}
 });

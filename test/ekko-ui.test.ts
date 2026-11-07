@@ -2906,3 +2906,39 @@ for (const destination of ['outside', 'other-composer', 'null'] as const)
     assert.equal(doc.activeElement, destination === 'null' ? doc.body : target);
     assert.equal(input.value, 'draft @'); assert.equal(f.sent.length, 0);
   });
+
+test('explicit knowledge reference preserves room draft and agents, survives source refresh, and never sends',async()=>{
+ const f=fixture();try{await linked(f);const textarea=f.root.querySelector<HTMLTextAreaElement>('[data-ekko-composer]')!;textarea.value='保留消息';textarea.dispatchEvent(new f.dom.window.Event('input',{bubbles:true}));
+  const agent=f.root.querySelector<HTMLInputElement>('[data-ekko-agent]')!;agent.checked=true;agent.dispatchEvent(new f.dom.window.Event('change',{bubbles:true}));
+  const option={label:'虚构检索片段',source:{kind:'selection' as const,documentId:DOC,blockId:A,selectedText:'精确正文',originalBlock:'精确正文'}};
+  await (f.ui as any).addReferenceSource(option,()=>true);await (f.ui as any).addReferenceSource(option,()=>true);
+  assert.equal(f.root.querySelectorAll('[data-ekko-source]:checked').length,1);assert.equal(textarea.value,'保留消息');assert.equal(f.root.querySelector<HTMLInputElement>('[data-ekko-agent]')!.checked,true);assert.equal(f.sent.length,0);
+  f.root.querySelector<HTMLButtonElement>('[data-ekko-action="refresh-sources"]')!.click();await tick();await tick();
+  assert.equal(f.root.querySelectorAll('[data-ekko-source]:checked').length,1);assert.equal(f.root.querySelector<HTMLTextAreaElement>('[data-ekko-composer]')!.value,'保留消息');
+ }finally{f.ui.dispose();f.dom.window.close();}
+});
+for(const mode of ['foreign-source','stale','unknown'] as const)test('knowledge reference refuses '+mode+' without changing room selections',async()=>{
+ const f=fixture();try{await linked(f);if(mode==='unknown')(f.ui as any).draft().unknownId='pending-original';
+  const option={label:'虚构检索',source:{kind:'selection' as const,documentId:mode==='foreign-source'?B:DOC,blockId:A,selectedText:'精确正文',originalBlock:'精确正文'}};
+  await assert.rejects((f.ui as any).addReferenceSource(option,()=>mode!=='stale'));assert.equal(f.root.querySelectorAll('[data-ekko-source]:checked').length,0);assert.equal(f.sent.length,0);
+ }finally{f.ui.dispose();f.dom.window.close();}
+});
+
+
+test('ordinary room answer workflow freezes exact verified reply and expires on same-ID edits', async () => {
+ const f=fixture();const calls:any[]=[];(f.options as any).onAnswerAction=async(action:any,source:any,current:any)=>{calls.push({action,source,current});};
+ f.history[room.id]=[{...message('answer-one','完成回答'),senderId:'agent-one',role:'assistant',preservesStreamingFlagPresence:true} as any];
+ try{await linked(f);const compose=f.root.querySelector<HTMLTextAreaElement>('[data-ekko-composer]')!;compose.value='保留草稿';compose.dispatchEvent(new f.dom.window.Event('input',{bubbles:true}));
+  const adopt=f.root.querySelector<HTMLButtonElement>('[data-ekko-action="adopt-answer"]');assert.ok(adopt);adopt.click();await tick();assert.equal(calls.length,1);assert.equal(calls[0].action,'adopt');assert.equal(calls[0].source.messageId,'answer-one');assert.equal(calls[0].source.content,'完成回答');assert.equal(calls[0].source.documentId,DOC);assert.equal(calls[0].source.link.roomId,room.id);assert.equal(calls[0].current(),true);
+  f.root.querySelector<HTMLButtonElement>('[data-ekko-action="draft-answer"]')!.click();await tick();assert.equal(calls[1].action,'task-draft');assert.equal(f.sent.length,0);assert.equal(compose.value,'保留草稿');
+  f.emitEvent(room.id,{event:'room.message',data:{...f.history[room.id][0],content:'同一消息修订'}});await tick();assert.equal(calls[0].current(),false);assert.equal(calls[1].current(),false);
+ }finally{f.ui.dispose();f.dom.window.close();}
+});
+test('ordinary room answer workflow excludes user tool stranger streaming invalid flags and unproven omitted flags', async()=>{
+ const variants=[{role:'user'},{role:'tool'},{senderId:'unknown'},{senderId:'auth:7'},{isStreaming:true},{isStreaming:null},{isStreaming:{}},{preservesStreamingFlagPresence:undefined}];
+ for(const variant of variants){const f=fixture();(f.options as any).onAnswerAction=async()=>{assert.fail('ineligible callback');};f.history[room.id]=[{...message('answer-one','完整文字'),senderId:'agent-one',role:'assistant',preservesStreamingFlagPresence:true,...variant} as any];try{await linked(f);assert.equal(f.root.querySelector('[data-ekko-action="adopt-answer"], [data-ekko-action="draft-answer"]'),null,JSON.stringify(variant));}finally{f.ui.dispose();f.dom.window.close();}}
+});
+test('ordinary room answer workflow rejects changed room ownership and unavailable legacy capability', async()=>{
+ const f=fixture();let current:(()=>boolean)|undefined;(f.options as any).onAnswerAction=async(_a:any,_s:any,guard:any)=>{current=guard;};f.history[room.id]=[{...message('answer-one','普通回答'),senderId:'agent-one',role:'assistant',isStreaming:false} as any];
+ try{await linked(f);f.root.querySelector<HTMLButtonElement>('[data-ekko-action="adopt-answer"]')!.click();await tick();assert.equal(current?.(),true);f.setDocument(B);assert.equal(current?.(),false);assert.equal(f.sent.length,0);}finally{f.ui.dispose();f.dom.window.close();}
+});

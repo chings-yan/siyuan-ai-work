@@ -2,7 +2,7 @@
   "name": "siyuan-ai-collab",
   "author": "chings-yan",
   "url": "https://github.com/chings-yan/siyuan-ai-work",
-  "version": "0.3.19",
+  "version": "0.3.25",
   "minAppVersion": "3.8.4",
   "backends": [
     "windows"

@@ -47,13 +47,13 @@ function frozenSystemMessage(snapshot:Snapshot,references:Reference[]):string {
   return `你是思源 AI Work 助手。不得直接修改用户正文。若建议修改，请返回 JSON {"text":"说明","plan":[{"blockId":"块 ID","expectedOriginal":"原文 Kramdown","replacement":"新 Markdown"}]}；普通讨论可直接回复。\n【本轮冻结引用】\n${refs || '（无）'}\n【本轮明确资料】\n${snapshot.contextText}`;
 }
 
-export async function streamChatSession(chatId:string, question:string, snapshot:Snapshot, config:ProviderConfig & {bridgeUrl:string; references?:Reference[]}, onDelta:(delta:string)=>void, signal?:AbortSignal,onRunEvent?:(event:string,raw:unknown)=>void):Promise<ChatRunResult> {
+export async function streamChatSession(chatId:string, question:string, snapshot:Snapshot, config:ProviderConfig & {bridgeUrl:string; references?:Reference[]}, onDelta:(delta:string)=>void, signal?:AbortSignal,onRunEvent?:(event:string,raw:unknown,runId?:string)=>void):Promise<ChatRunResult> {
   if(!question.trim()) throw new Error('没有可发送的用户消息');
   const client=createBridgeClient({bridgeUrl:config.bridgeUrl,capabilityToken:config.capabilityToken},config.documentRootId||snapshot.documentId);
-  return client.streamChatForChat(chatId,question,{systemMessage:frozenSystemMessage(snapshot,config.references??[])},x=>{if(x.delta) onDelta(x.delta);if(x.event)onRunEvent?.(x.event,x.raw);},signal);
+  return client.streamChatForChat(chatId,question,{systemMessage:frozenSystemMessage(snapshot,config.references??[])},x=>{if(x.delta) onDelta(x.delta);if(x.event)onRunEvent?.(x.event,x.raw,x.runId);},signal);
 }
 
-export async function streamThreadChat(thread:Pick<ChatThread,'id'|'adapter'|'state'|'storedSessionId'|'hermesSessionId'|'connectionId'|'legacyBridgeUrl'>,question:string,snapshot:Snapshot,config:ProviderConfig & {bridgeUrl:string; references?:Reference[]},onDelta:(delta:string)=>void,signal?:AbortSignal,onRunEvent?:(event:string,raw:unknown)=>void):Promise<ChatRunResult> {
+export async function streamThreadChat(thread:Pick<ChatThread,'id'|'adapter'|'state'|'storedSessionId'|'hermesSessionId'|'connectionId'|'legacyBridgeUrl'>,question:string,snapshot:Snapshot,config:ProviderConfig & {bridgeUrl:string; references?:Reference[]},onDelta:(delta:string)=>void,signal?:AbortSignal,onRunEvent?:(event:string,raw:unknown,runId?:string)=>void):Promise<ChatRunResult> {
   if(thread.adapter==='unresolved'||(thread.state!=='ready'&&!(thread.state==='pending'&&(thread.adapter==='serve'||thread.adapter==='studio'))))throw new Error('Chat 来源或结果待确认，不能发送');
   const route=resolveThreadRoute(thread);
   if(!route)throw new Error('Chat 来源或结果待确认，不能发送');

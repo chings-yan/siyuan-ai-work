@@ -35,7 +35,7 @@ test('connections reports only authenticated companion metadata and preserves se
   assert.equal(reply.status,200);
   assert.deepEqual(reply.body.data,[{id:'studio-default',kind:'studio',displayName:'Hermes Studio',state:'ready',profile:'default',installId:null}]);
   assert.equal(calls.length,2);
-  assert.deepEqual(reply.body.meta,{schemaVersion:1,bridgeVersion:null,capabilities:['hermes-connection-inspection-v1','ekko-authorization-record-v1']});
+  assert.deepEqual(reply.body.meta,{schemaVersion:1,bridgeVersion:null,capabilities:['hermes-connection-inspection-v1','ekko-authorization-record-v1','hermes-shared-session-v1','hermes-history-snapshot-v1']});
   assert.deepEqual(await readdir(directory),[]);
 });
 
@@ -261,7 +261,7 @@ test('a completed bind after floating close cannot assign a second Chat ID to th
     await tick();plugin.toggleFloatingPanel();release();await first;
     const next=root.ownerDocument.createElement('div');next.className='sac';root.ownerDocument.body.appendChild(next);next.innerHTML=createChatShell();attachHermesRoomView(plugin,next);
     await plugin.associateStudio(next);const nextRadio=next.querySelector<HTMLInputElement>('input[type=radio]')!;nextRadio.checked=true;nextRadio.dispatchEvent(new (root.ownerDocument.defaultView as any).Event('change',{bubbles:true}));next.querySelector<HTMLButtonElement>('[data-studio-confirm]')!.click();await tick();await tick();
-    assert.equal(binds,1);assert.equal(saved.length,1);assert.match(next.querySelector('[data-status]')!.textContent||'',new RegExp(saved[0].chatId));
+    assert.equal(binds,1);assert.equal(saved.length,1);assert.match(next.querySelector('[data-status]')!.textContent||'',/已关联.*打开对话/);assert.equal(next.querySelector<HTMLButtonElement>('[data-action="open-associated-chat"]')!.dataset.chatId,saved[0].chatId);assert.equal((next.querySelector('[data-status]')!.textContent||'').includes(saved[0].chatId),false);
   }finally{globalThis.fetch=originalFetch;}
 });
 
@@ -284,7 +284,7 @@ test('pending unknown association blocks a new UUID for the same candidate', asy
   plugin.workStore={listChats:async()=>[],listPending:async()=>[{id:'chat:old-local',kind:'chat',workId:'work-1',state:'unknown',details:`关联 Chat 回执后本地正式关系保存失败；chatId=old-local connectionId=studio-default documentRootId=${ROOT} storedSessionId=external-1`,updatedAt:'2026-09-24T00:00:00Z'}]};
   const originalFetch=globalThis.fetch;globalThis.fetch=async(url:any)=>{if(String(url).endsWith('/sessions'))return Response.json({data:[{id:'external-1',title:'已有对话'}]});binds++;throw new Error('must not bind');};
   try{await plugin.associateStudio(root as HTMLElement);const radio=root.querySelector<HTMLInputElement>('input[type=radio]')!;radio.checked=true;radio.dispatchEvent(new (root.ownerDocument.defaultView as any).Event('change',{bubbles:true}));root.querySelector<HTMLButtonElement>('[data-studio-confirm]')!.click();await tick();await tick();}finally{globalThis.fetch=originalFetch;}
-  assert.equal(binds,0);assert.match(root.querySelector('[data-status]')!.textContent||'',/old-local.*核对/);
+  assert.equal(binds,0);assert.match(root.querySelector('[data-status]')!.textContent||'',/核对.*勿重复关联/);assert.doesNotMatch(root.querySelector('[data-status]')!.textContent||'',/old-local|Chat ID|分配/);
 });
 
 test('double candidate confirmation sends one bind request', async()=>{

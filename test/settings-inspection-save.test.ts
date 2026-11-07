@@ -124,3 +124,53 @@ for(const phase of ['listChats','getResume'] as const)for(const lifecycle of ['p
    assert.equal(input.value,'fictional destination private draft','returning to B restores its own draft');assert.equal(consistent,true);assert.equal(isolated,true);assert.equal(f.p.threadConnection,f.p.connectionIdentity());assert.deepEqual(await f.p.loadData('work-formal-v2'),formal);
   }finally{globalThis.fetch=fetchBefore;f.close();}
  });
+
+test('same-ID candidate credentials cannot refresh the saved connection card, including after reopen',async()=>{
+ const f=await fixture(),fetchBefore=globalThis.fetch;
+ try{
+  const savedId=f.p.confirmedConnectionId;f.p.connectionViews=[{...studio,id:savedId}];
+  globalThis.fetch=async u=>Response.json(String(u).endsWith('/health')?{ok:true,service:'siyuan-ai-collab-bridge'}:{data:[{...studio,id:savedId}]});f.p.workHost.listNotebooks=async()=>[];let writes=0;const save=f.p.saveData.bind(f.p);f.p.saveData=async(k:string,v:any)=>{if(k==='settings')writes++;return save(k,v);};
+  f.p.openSettings(f.root,'hermes');const input=fields(f);input.token.value='fictional-unsaved-candidate';input.token.dispatchEvent(new f.dom.window.Event('input',{bubbles:true}));click(f,'detect-bridge');await tick();
+  for(const reopen of [false,true]){
+   if(reopen){f.p.settingsDialog.close();f.p.openSettings(f.root,'hermes');await tick();}
+   const card=f.doc.querySelector('[data-connection-card]')!;assert.match(card.querySelector('[data-current-service]')!.textContent||'',/Hermes Studio/);assert.doesNotMatch(card.querySelector('[data-bridge-status]')!.textContent||'',/已连接/);assert.match(card.querySelector('[data-bridge-status]')!.textContent||'',/候选/);
+   assert.equal(card.querySelector<HTMLElement>('[data-connection-candidate]')!.hidden,false);assert.equal(card.querySelector<HTMLElement>('[data-settings-action="confirm-bridge"]')!.hidden,false);assert.doesNotMatch(f.doc.body.innerHTML,/fictional-unsaved-candidate/);assert.equal(writes,0);assert.equal(f.p.bridgeToken,'fictional-token');assert.equal(f.input.value,'原 Chat 草稿');
+  }
+  fields(f).token.value='fictional-unsaved-candidate';
+  const confirm=f.doc.querySelector<HTMLButtonElement>('[data-settings-action="confirm-bridge"]')!;confirm.focus();confirm.click();await tick();assert.equal(writes,1);assert.match(f.doc.querySelector('[data-bridge-status]')!.textContent||'',/已连接.*会话读取正常/);assert.equal(f.doc.activeElement,f.doc.querySelector('[data-settings-action="detect-bridge"]'));
+ }finally{globalThis.fetch=fetchBefore;f.p.settingsDialog?.dispose();f.close();}
+});
+
+test('changed saved configuration cannot reuse an old matching inspection scope',async()=>{
+ for(const field of ['bridgeToken','bridgeUrl','confirmedConnectionId'] as const){
+  const f=await fixture(),fetchBefore=globalThis.fetch;try{
+   globalThis.fetch=async u=>Response.json(String(u).endsWith('/health')?{ok:true,service:'siyuan-ai-collab-bridge'}:{data:f.p.connectionViews});f.p.workHost.listNotebooks=async()=>[];
+   f.p.openSettings(f.root,'hermes');click(f,'detect-bridge');await tick();assert.match(f.doc.querySelector('[data-bridge-status]')!.textContent||'',/已连接/);f.p.settingsDialog.close();
+   f.p[field]=field==='bridgeUrl'?'http://127.0.0.1:8789':field==='bridgeToken'?'fictional-external-credential':'fictional-other-target';
+   f.p.openSettings(f.root,'hermes');assert.doesNotMatch(f.doc.querySelector('[data-bridge-status]')!.textContent||'',/已连接/);assert.match(f.doc.querySelector('[data-bridge-status]')!.textContent||'',/候选/);assert.doesNotMatch(f.doc.body.innerHTML,/fictional-external-credential/);assert.equal(f.input.value,'原 Chat 草稿');
+  }finally{globalThis.fetch=fetchBefore;f.p.settingsDialog?.dispose();f.close();}
+ }
+});
+test('saved-scope companion failure remains the main warning after close and reopen',async()=>{
+ const f=await fixture(),fetchBefore=globalThis.fetch;try{
+  globalThis.fetch=async()=>{throw Error('fictional-private-unreachable');};f.p.workHost.listNotebooks=async()=>[];
+  f.p.openSettings(f.root,'hermes');click(f,'detect-bridge');await tick();
+  for(const reopen of [false,true]){if(reopen){f.p.settingsDialog.close();f.p.openSettings(f.root,'hermes');}assert.match(f.doc.querySelector('[data-bridge-status]')!.textContent||'',/本机连接组件未响应/);assert.doesNotMatch(f.doc.querySelector('[data-bridge-status]')!.textContent||'',/fictional-private/);}
+ }finally{globalThis.fetch=fetchBefore;f.p.settingsDialog?.dispose();f.close();}
+});
+
+test('maintenance requires the single card Use action, and Bridge-only intent survives a recovered service at confirm',async()=>{
+ for(const confirmed of [false,true]){
+  const f=await fixture({confirmed}),fetchBefore=globalThis.fetch;try{
+   const original=f.p.confirmedConnectionId,selected=f.p.selectedConnectionId,pairing=f.p.bridgeToken;let writes=0,readbacks=0,connections=0;
+   const save=f.p.saveData.bind(f.p),load=f.p.loadData.bind(f.p);f.p.saveData=async(k:string,v:any)=>{if(k==='settings')writes++;return save(k,v);};f.p.loadData=async(k:string)=>{if(k==='settings'&&writes)readbacks++;return load(k);};
+   globalThis.fetch=async u=>Response.json(String(u).endsWith('/health')?{ok:true,service:'siyuan-ai-collab-bridge'}:{data:++connections===1?[]:[studio]});f.p.workHost.listNotebooks=async()=>[];
+   f.p.openSettings(f.root,'hermes');fields(f).token.value=pairing;
+   const maintenance=f.doc.querySelector<HTMLButtonElement>('[data-settings-action="prepare-bridge"],[data-settings-action="save"]')!;maintenance.click();await tick();assert.equal(writes,0);assert.equal(connections,0);
+   click(f,'check-bridge');await tick();assert.equal(writes,0);assert.equal(connections,1);
+   const confirm=f.doc.querySelector<HTMLButtonElement>('[data-settings-action="confirm-bridge"]')!;assert.equal(confirm.hidden,false);assert.equal(confirm.textContent,'使用此连接');assert.match(f.doc.querySelector('[data-candidate-status]')!.textContent||'',/仅保存 Bridge.*配对/);
+   confirm.click();await tick();assert.equal(writes,1);assert.equal(readbacks,1);assert.equal(connections,2);assert.equal((await load('settings')).bridgeToken,pairing);assert.equal((await load('settings')).hermesConnectionId,original);assert.equal(f.p.confirmedConnectionId,original);assert.equal(f.p.selectedConnectionId,selected);assert.equal(fields(f).token.value,'');assert.equal(f.input.value,'原 Chat 草稿');
+   click(f,'view-diagnostic');assert.equal(JSON.parse(f.doc.querySelector('[data-diagnostic-preview]')!.textContent!).saveOutcome,'bridge-only');assert.doesNotMatch(f.doc.body.innerHTML,/fictional-token/);
+  }finally{globalThis.fetch=fetchBefore;f.p.settingsDialog?.dispose();f.close();}
+ }
+});

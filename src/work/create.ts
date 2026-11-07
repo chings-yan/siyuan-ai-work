@@ -2,22 +2,24 @@ import { isValidDocumentRootId } from '../core.ts';
 import type { NativeTaskReader, TaskView } from '../task/reader.ts';
 import { WorkService, WorkGoalError, type WorkRecord } from './service.ts';
 import { WorkStore, type PendingOperation } from './store.ts';
+import { assertWorkTemplateSnapshot, type WorkTemplateSnapshot } from './templates.ts';
 
 export type Notebook = { id: string; name: string };
 export type ExistingDocument = { id: string; title: string; notebookId: string };
 export type CreateContext = { documentId: string; title: string; focusBlockId?: string | null };
 export type TaskSelection = Pick<TaskView, 'id' | 'title' | 'documentId' | 'projectId'>;
-export type CreateInput = { mode: 'blank' | 'current'; title: string; goal: string; notebookId: string; documentId: string | null; taskId: string | null; taskSelection?: TaskSelection };
+export type CreateInput = { mode: 'blank' | 'current'; title: string; goal: string; notebookId: string; documentId: string | null; taskId: string | null; taskSelection?: TaskSelection; template?: WorkTemplateSnapshot };
 export type CreationHost = {
   listNotebooks(): Promise<Notebook[]>;
   getDocumentNotebook(id: string): Promise<string>;
   getDocumentTitle(id: string): Promise<string>;
   searchDocuments(query: string, notebooks: string[]): Promise<ExistingDocument[]>;
   getDocumentIdsByPath(notebook: string, title: string): Promise<string[]>;
-  createDocument(notebook: string, title: string, operation: string): Promise<string>;
+  createDocument(notebook: string, title: string, operation: string, template?: WorkTemplateSnapshot): Promise<string>;
+  verifyCreatedTemplate?(documentId: string, notebook: string, operation: string, template: WorkTemplateSnapshot): Promise<void>;
   findCreatedDocuments(notebook: string, operation: string): Promise<string[]>;
 };
-type Intent = { version: 1; input: CreateInput; documentId: string | null; workReady: boolean; repairAttempted?: boolean };
+type Intent = { version: 1; input: CreateInput; documentId: string | null; workReady: boolean; repairAttempted?: boolean; templateVerified?: boolean };
 export type CreateResult = { kind: 'complete' | 'pending' | 'partial'; operationId: string; work: WorkRecord | null; message: string };
 export type GoalResult = { kind: 'complete' | 'pending'; operationId: string; work: WorkRecord | null; message: string };
 type GoalIntent = { version: 1; goal: string; attempted: boolean };
@@ -149,8 +151,14 @@ export class WorkCreator {
       typeof i.notebookId !== 'string' || !(i.taskId === null || typeof i.taskId === 'string') || !(i.documentId === null || isValidDocumentRootId(i.documentId)) ||
       !(value.documentId === null || isValidDocumentRootId(value.documentId)) || typeof value.workReady !== 'boolean' ||
       !(value.repairAttempted === undefined || typeof value.repairAttempted === 'boolean') ||
+      !(value.templateVerified === undefined || typeof value.templateVerified === 'boolean') ||
+      (value.templateVerified === true && (!i.template || !value.documentId)) ||
       !(i.taskSelection === undefined || (validTaskSelection(i.taskSelection) && i.taskSelection.id === i.taskId)) ||
       (i.mode === 'current' && value.documentId !== i.documentId)) throw new Error('创建恢复记录格式错误，请人工核对');
+    if (i.template !== undefined) {
+      assertWorkTemplateSnapshot(i.template);
+      if (i.mode !== 'blank' || (value.workReady && value.templateVerified !== true)) throw new Error('创建恢复记录中的模板状态无法核验');
+    }
     return value;
   }
   private async save(id: string, intent: Intent): Promise<void> {
@@ -161,8 +169,13 @@ export class WorkCreator {
   }
   async submit(input: CreateInput): Promise<CreateResult> {
     // Capture before the first await: callers/editor changes cannot retarget a submitted operation.
-    const captured = { ...input, taskSelection:input.taskSelection === undefined ? undefined : {...input.taskSelection} };
+    const captured = { ...input, taskSelection:input.taskSelection === undefined ? undefined : {...input.taskSelection}, template:input.template === undefined ? undefined : {...input.template} };
     return this.exclusive(async () => {
+      if (captured.template !== undefined) {
+        assertWorkTemplateSnapshot(captured.template);
+        if (captured.mode !== 'blank') throw new Error('模板仅用于新建工作文档，不会写入现有文档');
+        if (!this.host.verifyCreatedTemplate) throw new Error('当前环境不能完整核验模板创建，请选择空白文档或更新插件');
+      }
       const blocked=(await this.pending()).some(p=>{
         const deferredId=this.deferredExisting.get(p.id);
         if(!deferredId||p.workId!==deferredId)return true;
@@ -194,7 +207,7 @@ export class WorkCreator {
       let submissionError = '';
       if (captured.mode === 'blank') {
         try {
-          intent.documentId = await this.host.createDocument(captured.notebookId,captured.title,id);
+          intent.documentId = await this.host.createDocument(captured.notebookId,captured.title,id,captured.template);
           await this.save(id,intent);
         } catch(error) { submissionError = message(error); }
       }
@@ -300,6 +313,14 @@ export class WorkCreator {
         await this.save(id,intent);
       }
       if (!intent.documentId) throw new Error('创建文档尚未确认');
+      if (intent.input.template && !intent.templateVerified) {
+        if (!this.host.verifyCreatedTemplate) throw new Error('当前环境不能完整核验原模板，保留创建记录');
+        await this.host.verifyCreatedTemplate(intent.documentId,intent.input.notebookId,id,intent.input.template);
+        // Persist complete readback before Work/Goal mutations. Subsequent recovery
+        // must not mistake later intentional edits for a failed template creation.
+        intent.templateVerified = true;
+        await this.save(id,intent);
+      }
       if (intent.repairAttempted) {
         const verified = await this.service.readWork(intent.documentId);
         if (!verified || verified.goal !== intent.input.goal.trim().replace(/\s+/g, ' '))

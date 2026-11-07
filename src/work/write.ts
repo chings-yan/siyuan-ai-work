@@ -2,7 +2,7 @@ import { normalizeForReadback, validatePlan, type EditPlan } from '../core.ts';
 import { assertWriteRoot } from './context.ts';
 
 export type FrozenProposal = { threadId: string; chatRootId: string; targetDocumentId: string; items: EditPlan[] };
-export type WritePort = { getRoot(blockId: string): Promise<string | null>; getMarkdown(blockId: string): Promise<string>; updateMarkdown(blockId: string, markdown: string): Promise<void> };
+export type WritePort = { getRoot(blockId: string): Promise<string | null>; getMarkdown(blockId: string): Promise<string>; beforeWrite?(): Promise<void> | void; updateMarkdown(blockId: string, markdown: string): Promise<void> };
 export class WriteFailure extends Error {
   constructor(message: string, readonly written: number, readonly total: number, readonly attempted = written) { super(message); this.name = 'WriteFailure'; }
 }
@@ -19,6 +19,7 @@ export async function applyApprovedProposal(proposal: FrozenProposal, port: Writ
     }
     validatePlan(proposal.items, current);
     for (const item of proposal.items) {
+      await port.beforeWrite?.();
       attempted++;
       await port.updateMarkdown(item.blockId, item.replacement);
       written++;

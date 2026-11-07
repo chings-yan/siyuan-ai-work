@@ -5,6 +5,7 @@ import type { ChatLink } from './store.ts';
 import type { RoomLink } from './room-store.ts';
 import type { WorkRecord, WorkStatus } from './service.ts';
 import type { NativeTaskReader, TaskList } from '../task/reader.ts';
+import { taskProgressLabel } from '../task/presentation.ts';
 import { isValidDocumentRootId } from '../core.ts';
 
 export type WorkPageContext = { documentId: string; title: string; focusBlockId: string | null };
@@ -14,6 +15,7 @@ export type WorkPageActions = {
   enter(workId: string): Promise<void>; resume(workId: string): Promise<void>;
   openDocument(workId: string, documentId: string): Promise<void>; task(taskId: string): Promise<void>;
   create(context: WorkPageContext | null, mode?: 'blank' | 'current'): Promise<void>;
+  editTask?(workId:string,taskId:string,current:()=>boolean):Promise<string>;
   settings?():void;createTask?(workId?:string,context?:WorkPageContext|null,current?:()=>boolean):Promise<void>;linkTask?(workId:string,current?:()=>boolean):Promise<boolean|void>; linkDocument(workId: string, context: WorkPageContext, current?:()=>boolean): Promise<boolean | void>;
   addGoal?(workId: string, currentGoal: string): Promise<void>;
   setStatus?(workId:string,status:WorkStatus,expectedStatus:WorkStatus,current:()=>boolean):Promise<boolean>;
@@ -25,6 +27,15 @@ const esc = (value: string) => value.replace(/[&<>"']/g, c => ({ '&':'&amp;', '<
 const button = (action: string, label: string, attributes = '') => `<button type="button" data-page-action="${action}" ${attributes}>${label}</button>`;
 const errorMarkup = (error: string) => `<p class="sac-page-error" role="alert">${esc(error)} ${button('refresh','重试读取')}</p>`;
 
+/** Shared by the event owner and trailing reads; hidden native tabs never start task reads. */
+export function isWorkPageVisible(root:HTMLElement):boolean {
+  if(!root.isConnected||root.ownerDocument.visibilityState==='hidden')return false;
+  for(let element:HTMLElement|null=root;element;element=element.parentElement){
+    if(element.hidden||element.classList.contains('fn__none')||element.getAttribute('aria-hidden')==='true')return false;
+    const style=element.ownerDocument.defaultView?.getComputedStyle(element);if(style?.display==='none'||style?.visibility==='hidden')return false;
+  }
+  return true;
+}
 export class WorkPage {
   private route: WorkPageRoute = {kind:'home'};
   private history: {route: WorkPageRoute; query: string; status: WorkStatus | 'all'}[] = [];
@@ -42,8 +53,12 @@ export class WorkPage {
   private taskResult:TaskList|null=null;
   private taskLoading=false;
   private taskGeneration=0;
+  private taskSearchVersion=0;
   private taskTimer?:ReturnType<typeof setTimeout>;
-  constructor(private readonly root: HTMLElement, private readonly options: { catalog: Pick<WorkCatalog,'load'>; context: WorkPageContext | null; actions: WorkPageActions; taskReader?:Pick<NativeTaskReader,'search'>;taskDocumentTitle?:(id:string)=>Promise<string> }) {
+  private taskRefresh:Promise<void>|null=null;
+  private taskRefreshRequest:{route:WorkPageRoute;generation:number}|null=null;
+  private tasksInvalidatedDuringLoad=false;
+  constructor(private readonly root: HTMLElement, private readonly options: { catalog: Pick<WorkCatalog,'load'>; context: WorkPageContext | null; actions: WorkPageActions; taskReader?:Pick<NativeTaskReader,'search'>&Partial<Pick<NativeTaskReader,'getTask'|'listRecent'>>;taskDocumentTitle?:(id:string)=>Promise<string> }) {
     this.context = options.context;
     root.addEventListener('click', this.click);
     root.addEventListener('input', this.filter);
@@ -77,6 +92,78 @@ export class WorkPage {
     }
     if (this.disposed || generation !== this.generation) return;
     this.loading = false; this.render();
+    if(this.tasksInvalidatedDuringLoad&&isWorkPageVisible(this.root)){
+      this.tasksInvalidatedDuringLoad=false;
+      await this.taskRefresh;
+      if(!this.disposed&&generation===this.generation)await this.refreshTasks();
+    }
+  }
+  /** Task invalidation never rebuilds filters, status edits, dialogs or the page shell. */
+  refreshTasks(): Promise<void> {
+    if(this.disposed||!this.options.taskReader||!isWorkPageVisible(this.root))return Promise.resolve();
+    if(this.route.kind==='home'&&this.taskQuery.trim())this.taskSearchVersion++;
+    if(this.loading){this.tasksInvalidatedDuringLoad=true;return Promise.resolve();}
+    if(!this.snapshot)return Promise.resolve();
+    this.tasksInvalidatedDuringLoad=false;
+    this.taskRefreshRequest={route:this.route,generation:this.generation};
+    if(this.taskRefresh)return this.taskRefresh;
+    const read=async()=>{
+      while(this.taskRefreshRequest){
+        const request=this.taskRefreshRequest;this.taskRefreshRequest=null;
+        if(this.disposed||this.route!==request.route||this.generation!==request.generation||!isWorkPageVisible(this.root))continue;
+        await this.readTasks(request.route,request.generation);
+      }
+    };
+    this.taskRefresh=read().finally(()=>{
+      this.taskRefresh=null;
+      const queued=this.taskRefreshRequest;
+      if(queued&&!this.disposed&&this.route===queued.route&&this.generation===queued.generation&&isWorkPageVisible(this.root))return this.refreshTasks();
+      this.taskRefreshRequest=null;
+    });
+    return this.taskRefresh;
+  }
+  private async readTasks(route:WorkPageRoute,generation:number):Promise<void> {
+    const snapshot=this.snapshot!,reader=this.options.taskReader!,searchGeneration=this.taskGeneration,query=this.taskQuery;
+    const current=()=>!this.disposed&&this.snapshot===snapshot&&this.route===route&&this.generation===generation&&isWorkPageVisible(this.root);
+      const rows=await Promise.all(snapshot.works.map(async row=>{
+        if(!reader.getTask||!row.tasks.value)return row;
+        const tasks=await Promise.all(row.tasks.value.map(async link=>{
+          if(link.connectionId!=='siyuan-native-local')return link;
+          try{return {...link,lookup:await reader.getTask!(link.taskId)};}
+          catch(error){return {...link,lookup:{kind:'unavailable' as const,reason:error instanceof Error?error.message:String(error)}};}
+        }));
+        return {...row,tasks:{value:tasks}};
+      }));
+      if(!current())return;
+      let recent=snapshot.recentTasks,result=this.taskResult,searchVersion:number|undefined;
+      if(route.kind==='home'&&searchGeneration===this.taskGeneration&&query===this.taskQuery){
+        try{if(query.trim()){searchVersion=++this.taskSearchVersion;result=await reader.search(query.trim());}else if(reader.listRecent)recent=await reader.listRecent(5);}
+        catch(error){const unavailable={kind:'unavailable' as const,reason:error instanceof Error?error.message:String(error)};if(query.trim())result=unavailable;else recent=unavailable;}
+      }
+      if(!current())return;
+      await this.readTaskTitles([...rows.flatMap(row=>(row.tasks.value||[]).flatMap(task=>task.lookup.kind==='found'?[task.lookup.value]:[])),...(recent.kind==='found'?recent.value:[]),...(result?.kind==='found'?result.value:[])]);
+      if(!current())return;
+      const byId=new Map(rows.map(row=>[row.id,row]));
+      this.snapshot={...snapshot,works:rows,continueWorks:snapshot.continueWorks.map(row=>byId.get(row.id)||row),recentTasks:recent};
+      if(searchGeneration===this.taskGeneration&&query===this.taskQuery&&(searchVersion===undefined||searchVersion===this.taskSearchVersion)){this.taskResult=result;if(searchVersion!==undefined)this.taskLoading=false;this.renderTaskResults();}
+      for(const element of this.root.querySelectorAll<HTMLElement>('[data-task-progress]')){
+        const row=byId.get(element.dataset.taskProgress!);if(row)element.textContent=this.progressLabel(row);
+      }
+      if(route.kind==='detail'&&route.section==='tasks'){
+        const row=byId.get(route.workId),container=this.root.querySelector<HTMLElement>('[data-linked-tasks]');
+        if(row&&container){
+          const active=this.root.ownerDocument.activeElement as HTMLElement|null;
+          const focused=active&&container.contains(active)?{action:active.dataset.pageAction,taskId:active.dataset.taskId}:null;
+          const page=this.root.querySelector<HTMLElement>('.sac-work-page'),scroll=page?.scrollTop;
+          container.innerHTML=this.linkedTasks(row);
+          if(focused){
+            const replacement=[...container.querySelectorAll<HTMLElement>('[data-page-action]')].find(button=>button.dataset.pageAction===focused.action&&button.dataset.taskId===focused.taskId);
+            if(replacement)replacement.focus({preventScroll:true});
+            else {container.tabIndex=-1;container.focus({preventScroll:true});}
+            if(page&&scroll!==undefined)page.scrollTop=scroll;
+          }
+        }
+      }
   }
   dispose(): void {
     this.disposed = true; this.generation++;
@@ -98,12 +185,13 @@ export class WorkPage {
     const cards = this.root.querySelector('[data-work-results]'); if (cards) cards.innerHTML = this.cards();
   };
   private async searchTasks(query:string,generation:number):Promise<void> {
-    if(this.disposed||this.route.kind!=='home'||!this.options.taskReader)return;
+    if(this.disposed||this.route.kind!=='home'||!this.options.taskReader||generation!==this.taskGeneration||query!==this.taskQuery.trim())return;
+    const version=++this.taskSearchVersion;
     let result:TaskList;
     try {result=await this.options.taskReader.search(query);}catch(error){result={kind:'unavailable',reason:error instanceof Error?error.message:String(error)};}
-    if(this.disposed||generation!==this.taskGeneration||this.route.kind!=='home')return;
+    if(this.disposed||generation!==this.taskGeneration||version!==this.taskSearchVersion||this.route.kind!=='home')return;
     if(result.kind==='found')await this.readTaskTitles(result.value);
-    if(this.disposed||generation!==this.taskGeneration||this.route.kind!=='home')return;
+    if(this.disposed||generation!==this.taskGeneration||version!==this.taskSearchVersion||this.route.kind!=='home')return;
     this.taskResult=result;this.taskLoading=false;this.renderTaskResults();
   }
   private async readTaskTitles(tasks:{documentId:string|null}[]):Promise<void>{
@@ -119,7 +207,21 @@ export class WorkPage {
     if(!result.value.length)return '<p>暂无匹配的未完成任务。</p>';
     return (this.taskQuery.trim()?'<p>搜索结果（最多 30 条）</p>':'')+result.value.map(task=>`<article class="sac-task-row"><div class="sac-task-title"><span aria-hidden="true">○</span><strong>${esc(task.title)}</strong></div>${task.documentId&&this.taskTitles.get(task.documentId)?`<small>文档：${esc(this.taskTitles.get(task.documentId)!)}</small>`:''}${task.documentId!==null?button('task','打开关联文档',`data-task-id="${esc(task.id)}"`):'<small>没有关联文档</small>'}</article>`).join('')||'<p>暂无匹配的未完成任务。</p>';
   }
-  private renderTaskResults():void {const results=this.root.querySelector<HTMLElement>('[data-page-task-results]');if(results)results.innerHTML=this.taskMarkup();}
+  private renderTaskResults():void {
+    const results=this.root.querySelector<HTMLElement>('[data-page-task-results]');if(!results)return;
+    // Read focus at replacement time: an awaited read may outlive a move to a native dialog.
+    const active=this.root.ownerDocument.activeElement as HTMLElement|null;
+    const focused=active&&results.contains(active)?{action:active.dataset.pageAction,taskId:active.dataset.taskId}:null;
+    const page=this.root.querySelector<HTMLElement>('.sac-work-page');
+    const top=results.scrollTop,left=results.scrollLeft,pageTop=page?.scrollTop,pageLeft=page?.scrollLeft;
+    results.innerHTML=this.taskMarkup();
+    if(focused){
+      const replacement=focused.action&&focused.taskId?[...results.querySelectorAll<HTMLElement>('[data-page-action][data-task-id]')].find(button=>button.dataset.pageAction===focused.action&&button.dataset.taskId===focused.taskId):undefined;
+      (replacement||results).focus({preventScroll:true});
+    }
+    results.scrollTop=top;results.scrollLeft=left;
+    if(page&&pageTop!==undefined&&pageLeft!==undefined){page.scrollTop=pageTop;page.scrollLeft=pageLeft;}
+  }
   private click = (event: Event): void => {
     const target = (event.target as Element).closest<HTMLButtonElement>('button[data-page-action]');
     if (!target || this.disposed || target.disabled) return;
@@ -145,6 +247,18 @@ export class WorkPage {
       return;
     }
     if (this.pending) return;
+    if(action==='edit-task'){
+      const route=this.route,taskId=target.dataset.taskId;
+      const task=route.kind==='detail'?this.snapshot?.works.find(row=>row.id===route.workId)?.tasks.value?.find(row=>row.taskId===taskId):undefined;
+      if(route.kind!=='detail'||!taskId||task?.connectionId!=='siyuan-native-local'||task.lookup.kind!=='found'||!this.options.actions.editTask)return;
+      const current=()=>!this.disposed&&this.route===route;
+      this.pending=true;target.disabled=true;this.updateNotice('正在打开任务…');
+      void (async()=>{
+        try{const message=await this.options.actions.editTask!(route.workId,taskId,current);if(current())this.updateNotice(message);}
+        catch(error){if(current())this.updateNotice(error instanceof Error?error.message:String(error));}
+        finally{this.pending=false;if(target.isConnected)target.disabled=false;}
+      })();return;
+    }
     void this.perform(async () => {
       const actions = this.options.actions;
       if (action === 'enter') await actions.enter(id);
@@ -167,7 +281,7 @@ export class WorkPage {
       else if (action === 'add-goal') await actions.addGoal?.(id,this.snapshot?.works.find(row=>row.id===id)?.record.value?.goal||'');
       else if(action==='set-status'){
         const route=this.route,work=this.snapshot?.works.find(row=>row.id===id)?.record.value;
-        const status=target.closest('[data-work-lifecycle]')?.querySelector<HTMLSelectElement>('[data-work-next-status]')?.value as WorkStatus;
+        const status=(target.dataset.nextStatus||target.closest('[data-work-lifecycle]')?.querySelector<HTMLSelectElement>('[data-work-next-status]')?.value) as WorkStatus;
         if(!work || !Object.hasOwn(statuses,status))throw Error('请刷新后重新选择 Work 状态');
         if(status===work.status)return;
         const current=()=>!this.disposed&&this.route===route;
@@ -188,6 +302,16 @@ export class WorkPage {
       else if (action === 'room') { const link=this.snapshot?.works.find(row=>row.id===id)?.rooms.value?.[Number(target.dataset.index)];if(link)await actions.openRoom?.(id,link); }
     });
   };
+  private updateNotice(message:string):void {
+    this.notice=message;
+    let notice=this.root.querySelector<HTMLElement>('[data-page-notice]');
+    if(!message){notice?.remove();return;}
+    if(!notice){
+      notice=this.root.ownerDocument.createElement('p');notice.dataset.pageNotice='';notice.className='sac-page-notice';
+      notice.setAttribute('role','status');notice.setAttribute('aria-live','polite');this.root.querySelector('.sac-page-header')?.after(notice);
+    }
+    notice.textContent=message;
+  }
   private async perform(operation: () => Promise<void>): Promise<void> {
     this.pending=true;const previousNotice=this.notice;
     try { await operation(); } catch(error) { this.notice=error instanceof Error?error.message:String(error); }
@@ -210,7 +334,7 @@ export class WorkPage {
       const count=result.error?'读取失败':result.value!.length;
       return `<button type="button" data-page-action="metric" data-work-metric="${key}" data-work-id="${esc(row.id)}" aria-label="查看“${esc(work?.title||row.id)}”的${label}列表，${count}"><span>${label}</span><strong>${count}</strong><span aria-hidden="true">›</span></button>`;
     }).join('');
-    return `<article data-work-card="${esc(row.id)}"><div class="sac-page-row"><span class="sac-work-kind">▤ 工作 · Work</span>${work?`<span class="sac-page-tag" data-status="${work.status}">${statuses[work.status]}</span>`:''}</div><h3>${esc(work?.title||row.id)}</h3>${work?.goal?`<p class="sac-work-goal">${esc(work.goal)}</p>`:work?'':'<p>Work 信息暂不可读取</p>'}<div class="sac-work-metrics" role="group" aria-label="工作内容">${metrics}</div>${errors.map(errorMarkup).join('')}<div class="sac-page-actions">${this.context&&this.context.documentId!==row.id&&work&&(this.route.kind==='home'||this.route.kind==='list'&&this.route.mode==='link')?button('link','关联当前文档作为资料',`data-work-id="${esc(row.id)}"`):''}${work?button('enter','打开工作文档',`data-work-id="${esc(row.id)}"`):''}${work&&this.route.kind==='home'&&this.snapshot?.continueWorks.some(item=>item.id===row.id)?button('resume','继续上次位置',`data-work-id="${esc(row.id)}"`):''}${button('detail','管理',`data-work-id="${esc(row.id)}"`)}</div></article>`;
+    return `<article data-work-card="${esc(row.id)}"><div class="sac-page-row"><span class="sac-work-kind">▤ 工作 · Work</span>${work?`<span class="sac-page-tag" data-status="${work.status}">${statuses[work.status]}</span>`:''}</div><h3>${esc(work?.title||row.id)}</h3>${work?.goal?`<p class="sac-work-goal">${esc(work.goal)}</p>`:work?'':'<p>Work 信息暂不可读取</p>'}<div class="sac-work-metrics" role="group" aria-label="工作内容">${metrics}</div><p class="sac-task-progress" data-task-progress="${esc(row.id)}">${esc(this.progressLabel(row))}</p>${errors.map(errorMarkup).join('')}<div class="sac-page-actions">${this.context&&this.context.documentId!==row.id&&work&&(this.route.kind==='home'||this.route.kind==='list'&&this.route.mode==='link')?button('link','关联当前文档作为资料',`data-work-id="${esc(row.id)}"`):''}${work?button('enter','打开工作文档',`data-work-id="${esc(row.id)}"`):''}${work&&this.route.kind==='home'&&this.snapshot?.continueWorks.some(item=>item.id===row.id)?button('resume','继续上次位置',`data-work-id="${esc(row.id)}"`):''}${button('detail','管理',`data-work-id="${esc(row.id)}"`)}</div></article>`;
   }
   private cards(): string {
     const rows=(this.snapshot?.works||[]).filter(row=>{
@@ -225,7 +349,7 @@ export class WorkPage {
     return `<div class="sac-page-filters"><input data-work-search aria-label="搜索 Work 名称或目标" placeholder="搜索名称、目标或状态" value="${esc(this.query)}"><select data-work-status aria-label="筛选 Work 状态"><option value="all">全部状态</option>${Object.entries(statuses).map(([value,label])=>`<option value="${value}" ${value===this.status?'selected':''}>${label}</option>`).join('')}</select></div><div class="sac-page-grid" data-work-results>${this.cards()}</div>`;
   }
   private lifecycle(work:WorkRecord):string {
-    return `<section class="sac-work-lifecycle" data-work-lifecycle aria-label="工作状态"><div><strong>${statuses[work.status]}</strong><span>${workStatusDescriptions[work.status]}</span></div>${this.options.actions.setStatus?`<details><summary>更改状态／结束工作</summary><p>达到预期结果后，手动标记“已完成”；不再推进时标记“已关闭”。任务完成或 AI 回复结束不会自动结束 Work，文档、资料与会话会继续保留。</p><div class="sac-page-actions"><label>改为 <select data-work-next-status aria-label="新的工作状态">${Object.entries(statuses).map(([value,label])=>`<option value="${value}" ${value===work.status?'selected':''}>${label}</option>`).join('')}</select></label>${button('set-status','确认更改',`data-work-id="${esc(work.id)}"`)}</div></details>`:''}</section>`;
+    return `<section class="sac-work-lifecycle" data-work-lifecycle aria-label="工作状态"><div><strong>${statuses[work.status]}</strong><span>${workStatusDescriptions[work.status]}</span></div>${this.options.actions.setStatus?`<div class="sac-page-actions">${work.status==='completed'||work.status==='closed'||work.status==='paused'?button('set-status','恢复工作',`data-work-id="${esc(work.id)}" data-next-status="active"`):''}${work.status!=='completed'?button('set-status','完成 Work',`data-work-id="${esc(work.id)}" data-next-status="completed"`):''}</div><details><summary>更改状态／结束工作</summary><p>达到预期结果后，手动标记“已完成”；不再推进时标记“已关闭”。任务完成或 AI 回复结束不会自动结束 Work，文档、资料与会话会继续保留。</p><div class="sac-page-actions"><label>改为 <select data-work-next-status aria-label="新的工作状态">${Object.entries(statuses).map(([value,label])=>`<option value="${value}" ${value===work.status?'selected':''}>${label}</option>`).join('')}</select></label>${button('set-status','确认更改',`data-work-id="${esc(work.id)}"`)}</div></details>`:''}</section>`;
   }
   private sessionGroup(id:string,kind:SessionChoice['kind'],choices:SessionChoice[],error?:string):string {
     const hermes=kind==='hermes',label=hermes?'AI 对话':'协作房间';
@@ -233,19 +357,24 @@ export class WorkPage {
     const rows=choices.filter(choice=>choice.kind===kind).map(choice=>`<article class="sac-session-row"><div><strong>${esc(sessionLabel(choice))}</strong><details class="sac-session-metadata"><summary>查看关联信息</summary><small>${esc(choice.kind==='hermes'?`ID：${choice.link.chatId} · 连接：${choice.link.connectionId} · 绑定文档：${choice.link.documentRootId}`:`房间 ${choice.link.roomId} · 账号 ${choice.link.accountUserId} · 设备 ${choice.link.deviceId}`)}</small></details></div>${button('session',hermes?'打开对话':'进入房间',`data-work-id="${esc(id)}" data-session-key="${esc(sessionKey(choice))}"`)}</article>`).join('');
     return `<section class="sac-session-group" data-session-kind="${kind}" aria-label="${label}" tabindex="-1"><div class="sac-section-heading"><h3>${label} <span>${hermes?'Hermes':'EKKO'}</span></h3><div class="sac-page-actions">${actions}</div></div><p>${hermes?'同一 Work 的多条对话列在下方；点“打开对话”切换。进入此 Work 后，也可用侧栏顶部的会话选择器。':'成员与 Agent 共同讨论，消息发送到房间。'}</p>${error?errorMarkup(error):rows||`<p class="sac-page-empty">尚未关联${label}。</p>`}</section>`;
   }
+  private progressLabel(row:CatalogWork):string {return row.tasks.error?'任务统计暂不可读取':`${row.tasks.value!.length?'关联任务 ':''}${taskProgressLabel(row.tasks.value!.map(task=>task.lookup))}`;}
+  private linkedTasks(row:CatalogWork):string {
+    if(row.tasks.error)return errorMarkup(row.tasks.error);
+    return row.tasks.value!.map(task=>`<article><strong>${esc(task.lookup.kind==='found'?task.lookup.value.title:task.taskId)}</strong>${task.lookup.kind==='unavailable'?errorMarkup(task.lookup.reason):task.lookup.kind==='missing'?'<p>任务已不存在；保留原关联供核对。</p>':`<small>${task.lookup.value.completed?'已完成':'未完成'}</small>${typeof task.lookup.value.customProgress==='number'?`<small>任务插件进度：${task.lookup.value.customProgress}%</small>`:''}${task.lookup.value.documentId?`${this.taskTitles.get(task.lookup.value.documentId)?`<small>文档：${esc(this.taskTitles.get(task.lookup.value.documentId)!)}</small>`:''}${!task.lookup.value.completed?button('task','打开关联文档',`data-task-id="${esc(task.taskId)}"`):''}`:'<small>没有关联文档</small>'}${task.connectionId==='siyuan-native-local'&&this.options.actions.editTask?button('edit-task','在任务插件中编辑',`data-work-id="${esc(row.id)}" data-task-id="${esc(task.taskId)}"`):''}`}</article>`).join('')||'<p>未关联任务，可随时跳过。</p>';
+  }
   private details(id: string, section='documents'): string {
     const row=this.snapshot?.works.find(item=>item.id===id);if(!row)return this.snapshot?.error?errorMarkup(this.snapshot.error):'<p>Work 尚未载入，请刷新核对。</p>';
     const work=row.record.value;
-    const heading=`<span class="sac-work-kind">工作 · Work</span><h2>${esc(work?.title||id)}</h2><p>${esc(work?work.goal:row.record.error||'')}</p><div class="sac-page-actions">${work?button('enter','打开工作文档',`data-work-id="${esc(id)}"`):''}${work&&this.options.actions.addGoal?button('add-goal',work.goal?'查看／核对目标':'添加目标（可选）',`data-work-id="${esc(id)}"`):''}</div>${work?this.lifecycle(work):''}<nav class="sac-page-actions sac-page-tabs" aria-label="工作内容分类">${([['documents','文档与资料'],['tasks','关联任务'],['sessions','AI 对话与房间']] as const).map(([key,label])=>button('section',label,`data-section="${key}" ${section===key?'aria-current="page"':''}`)).join('')}</nav>`;
+    const heading=`<span class="sac-work-kind">工作 · Work</span><h2>${esc(work?.title||id)}</h2><p>${esc(work?work.goal:row.record.error||'')}</p><div class="sac-page-actions">${work?button('enter','打开工作文档',`data-work-id="${esc(id)}"`):''}${work&&this.options.actions.addGoal?button('add-goal',work.goal?'查看／核对目标':'添加目标（可选）',`data-work-id="${esc(id)}"`):''}</div>${work?this.lifecycle(work):''}<p class="sac-task-progress" data-task-progress="${esc(id)}">${esc(this.progressLabel(row))}</p><nav class="sac-page-actions sac-page-tabs" aria-label="工作内容分类">${([['documents','文档与资料'],['tasks','关联任务'],['sessions','AI 对话与房间']] as const).map(([key,label])=>button('section',label,`data-section="${key}" ${section===key?'aria-current="page"':''}`)).join('')}</nav>`;
     if(section==='documents')return heading+`<p>点击文档在思源原生编辑器中打开；外部资料保留原位。</p>${row.documents.error?errorMarkup(row.documents.error):row.documents.value!.map(doc=>`<article><strong>${esc(doc.title.value||doc.id)}</strong><small>${doc.kind==='root'?'Work 根文档':doc.kind==='child'?'子文档':'外部资料'}</small>${doc.title.error?errorMarkup(doc.title.error):''}${button('document','打开文档',`data-work-id="${esc(id)}" data-document-id="${esc(doc.id)}"`)}</article>`).join('')}`;
-    if(section==='tasks')return heading+`<div class="sac-page-actions">${this.options.actions.linkTask?button('link-task','关联已有任务',`data-work-id="${esc(id)}"`):''}${this.options.actions.createTask?button('create-task','在任务插件中新建'):''}</div><p>任务是可选待办；没有任务也可以推进 Work。</p>${row.tasks.error?errorMarkup(row.tasks.error):row.tasks.value!.map(task=>`<article><strong>${esc(task.lookup.kind==='found'?task.lookup.value.title:task.taskId)}</strong>${task.lookup.kind==='unavailable'?errorMarkup(task.lookup.reason):task.lookup.kind==='missing'?'<p>任务已不存在；保留原关联供核对。</p>':`<small>${task.lookup.value.completed?'已完成':'未完成'}</small>${task.lookup.value.documentId?`${this.taskTitles.get(task.lookup.value.documentId)?`<small>文档：${esc(this.taskTitles.get(task.lookup.value.documentId)!)}</small>`:''}${!task.lookup.value.completed?button('task','打开关联文档',`data-task-id="${esc(task.taskId)}"`):''}`:'<small>没有关联文档</small>'}`}</article>`).join('')||'<p>未关联任务，可随时跳过。</p>'}`;
+    if(section==='tasks')return heading+`<div class="sac-page-actions">${this.options.actions.linkTask?button('link-task','关联已有任务',`data-work-id="${esc(id)}"`):''}${this.options.actions.createTask?button('create-task','在任务插件中新建'):''}</div><p>任务是可选待办；没有任务也可以推进 Work。</p><div data-linked-tasks>${this.linkedTasks(row)}</div>`;
     const choices=sessionChoices(id,row.chats.value||[],row.rooms.value||[]);
     return heading+`<p>会话归属于这个 Work；明确打开对话或房间时才切换。</p>${this.sessionGroup(id,'hermes',choices,row.chats.error)}${this.sessionGroup(id,'ekko',choices,row.rooms.error)}`;
   }
   private render(): void {
     if(this.disposed)return;
     const data=this.snapshot;
-    const taskSection=`<h3>未完成待办</h3><p class="sac-task-source">来自任务笔记管理 · 可按需关联到 Work</p>${this.options.taskReader?`<label>搜索任务<input data-page-task-search placeholder="搜索任务标题或备注" maxlength="100" value="${esc(this.taskQuery)}"></label>`:''}<div data-page-task-results>${this.taskMarkup()}</div>`;
+    const taskSection=`<h3>未完成待办</h3><p class="sac-task-source">来自任务笔记管理 · 可按需关联到 Work</p>${this.options.taskReader?`<label>搜索任务<input data-page-task-search placeholder="搜索任务标题或备注" maxlength="100" value="${esc(this.taskQuery)}"></label>`:''}<div data-page-task-results tabindex="-1" role="region" aria-label="未完成任务结果">${this.taskMarkup()}</div>`;
     let body='';
     if(this.route.kind==='detail')body=this.details(this.route.workId,this.route.section);
     else if(this.route.kind==='list')body=`<h2>${this.route.mode==='link'?'选择要关联资料的 Work':'选择已有 Work'}</h2><p>打开工作文档继续读写。等待回复时，原会话保持不变。${this.route.mode==='link'?'关联当前文档需单独点击确认。':'已完成与已关闭的工作可通过状态筛选查看。'}</p>${this.filters()}`;
@@ -257,7 +386,7 @@ export class WorkPage {
       const documentEntry=`<section class="sac-home-document" aria-label="当前文档"><div><span class="sac-home-eyebrow">从文档开始</span>${captured?`<h3>${esc(captured.title||'当前文档')}</h3><p>打开这篇文档和聊天侧栏，按需新建或关联对话。</p>`:'<p>请先打开一篇文档，再回到主页开始。也可以选择或新建 Work。</p>'}</div>${captured&&this.options.actions.startDocument?button('start-document','在这篇文档开始'):''}</section>`;
       body=`<section class="sac-home-welcome"><div><span class="sac-home-eyebrow">你的文档工作台 · ${esc(date)}</span><h2>今天想推进什么？</h2><p>普通文档可直接使用；持续工作可用 Work 整理文档、资料与会话。</p></div><div class="sac-page-actions">${button('create','＋ 新建 Work')}${button('list','选择已有 Work')}</div></section><div class="sac-home-layout"><main class="sac-home-main" aria-label="工作列表">${documentEntry}<div class="sac-section-heading"><h3>${firstUse?'持续工作 · Work 可选':'最近工作 · Work'}</h3>${!firstUse?button('list','查看全部 →'):''}</div>${firstUse?`<section class="sac-first-use" data-first-use><span class="sac-home-symbol" aria-hidden="true">▤</span><h3>把要推进的事，放进一篇文档</h3><p>已有文档可以直接使用，目标和 AI 都可稍后添加。</p><div class="sac-page-actions">${button('create','新建工作文档')}${button('create-existing','使用已有文档')}</div><ol><li><strong>建立 Work</strong><span>文档、资料与会话在一起</span></li><li><strong>可选关联任务</strong><span>已有待办按需加入</span></li><li><strong>按需连接 AI</strong><span>可稍后连接，先整理工作</span></li></ol></section>`:recent.length?`<div class="sac-page-grid sac-home-cards">${recent.map(row=>this.card(row)).join('')}</div>`:'<p class="sac-page-empty">正在准备工作列表；读取失败时请重试。</p>'}${this.context&&recent.length?`<details class="sac-link-context"><summary>关联资料：${esc(this.context.title||'当前文档')}</summary><p>已固定这篇文档；点击目标卡片的“关联当前文档作为资料”后确认。</p><small>文档 ID：${esc(this.context.documentId)}</small>${button('link-list','在列表中关联当前文档')}</details>`:''}</main><aside class="sac-home-aside"><section class="sac-task-panel" aria-label="待办任务"><div class="sac-section-heading"><span class="sac-home-eyebrow">任务 · 待办</span>${this.options.actions.createTask?button('create-task','＋ 新建任务'):''}</div>${taskSection}</section><section class="sac-home-ai"><span aria-hidden="true">✦</span><div><strong>让 AI 加入工作</strong><p>AI 可稍后连接。普通文档和 Work 都可先使用。</p>${this.options.actions.settings?button('settings','连接与设置 →'):''}</div></section></aside></div>`;
     }
-    this.root.innerHTML=`<div class="sac-work-page"><div class="sac-page-inner"><header class="sac-page-row sac-page-header"><strong><span class="sac-brand-icon" aria-hidden="true">W</span> AI Work</strong><nav class="sac-page-actions">${this.route.kind!=='home'?button('back','返回'):''}${this.route.kind!=='home'?button('home','主页'):''}${button('refresh','刷新')}${this.options.actions.settings?button('settings','设置'):''}</nav></header>${this.loading?'<p role="status">正在读取 Work…</p>':''}${data?.error?errorMarkup(data.error):''}${this.notice?`<p role="status" class="sac-page-notice">${esc(this.notice)}</p>`:''}${this.route.kind==='list'&&this.route.mode==='link'&&this.context?`<div class="sac-link-context"><strong>待关联资料：${esc(this.context.title||'当前文档')}</strong><details><summary>查看文档 ID</summary>${esc(this.context.documentId)}</details></div>`:''}${body}</div></div>`;
+    this.root.innerHTML=`<div class="sac-work-page"><div class="sac-page-inner"><header class="sac-page-row sac-page-header"><strong><span class="sac-brand-icon" aria-hidden="true">W</span> AI Work</strong><nav class="sac-page-actions">${this.route.kind!=='home'?button('back','返回'):''}${this.route.kind!=='home'?button('home','主页'):''}${button('refresh','刷新')}${this.options.actions.settings?button('settings','设置'):''}</nav></header>${this.loading?'<p role="status">正在读取 Work…</p>':''}${data?.error?errorMarkup(data.error):''}${this.notice?`<p role="status" aria-live="polite" class="sac-page-notice" data-page-notice>${esc(this.notice)}</p>`:''}${this.route.kind==='list'&&this.route.mode==='link'&&this.context?`<div class="sac-link-context"><strong>待关联资料：${esc(this.context.title||'当前文档')}</strong><details><summary>查看文档 ID</summary>${esc(this.context.documentId)}</details></div>`:''}${body}</div></div>`;
   }
 }
 

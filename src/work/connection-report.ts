@@ -3,7 +3,7 @@ import type {StudioReadWarning} from '../bridge.ts';
 
 export type ConnectionKind = 'serve' | 'studio' | 'legacy-api';
 export type ConnectionState = 'ready' | 'offline' | 'auth_missing' | 'auth_failed' | 'incompatible' | 'install_mismatch' | 'install_changed' | 'connected' | 'configured';
-export type CompanionCapability = 'hermes-connection-inspection-v1' | 'ekko-authorization-record-v1';
+export type CompanionCapability = 'hermes-connection-inspection-v1' | 'ekko-authorization-record-v1' | 'hermes-shared-session-v1' | 'hermes-history-snapshot-v1';
 export type CompanionMetadata = {schemaVersion:1;bridgeVersion:string|null;capabilities:CompanionCapability[]};
 export type AuthorizationRecord = {source:'app-login-record';expiresAt:number};
 export type SaveOutcome = 'not-requested' | 'saved' | 'bridge-only' | 'failed' | 'unknown' | 'stale';
@@ -13,7 +13,7 @@ export type InspectionEvidence = {checkedAt:string;code:InspectionCode;reads:Rea
 export type ReportContext = {pluginVersion:string;freshness:'current'|'previous'|'unconfirmed';candidateKind:ConnectionKind|null;confirmedKind:ConnectionKind|null;saveOutcome:SaveOutcome};
 export type ConnectionDiagnostic = {schemaVersion:1;pluginVersion:string|null;companion:CompanionMetadata|null;checkedAt:string|null;freshness:ReportContext['freshness'];completed:boolean;bridgeAuthenticated:boolean|null;code:InspectionCode|null;reads:ReadEvidence[];services:Array<{kind:ConnectionKind;state:ConnectionState;readWarning?:StudioReadWarning}>;candidateKind:ConnectionKind|null;confirmedKind:ConnectionKind|null;saveOutcome:SaveOutcome};
 
-const CAPABILITIES:readonly CompanionCapability[]=['hermes-connection-inspection-v1','ekko-authorization-record-v1'];
+const CAPABILITIES:readonly CompanionCapability[]=['hermes-connection-inspection-v1','ekko-authorization-record-v1','hermes-shared-session-v1','hermes-history-snapshot-v1'];
 const CODES:readonly InspectionCode[]=['ok','invalid_address','health_unreachable','health_invalid','pairing_required','pairing_rejected','connections_http_error','connections_invalid','read_incomplete'];
 const KINDS:readonly ConnectionKind[]=['serve','studio','legacy-api'];
 const SAVE_OUTCOMES:readonly SaveOutcome[]=['not-requested','saved','bridge-only','failed','unknown','stale'];

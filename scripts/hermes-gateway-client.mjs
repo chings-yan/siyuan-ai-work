@@ -199,7 +199,7 @@ export function createGatewayClient({ baseUrl, token, profile = 'default', socke
       runtimeByStored.set(storedSessionId, result.session_id);
       return result.session_id;
     },
-    async history(storedSessionId) {
+    async history(storedSessionId, { captureSnapshotRecords = false } = {}) {
       if (closed) throw new Error('Hermes 连接已关闭');
       if (typeof storedSessionId !== 'string' || !storedSessionId.trim()) throw new Error('Hermes 历史会话身份无效');
       const controller = new AbortController();
@@ -209,7 +209,7 @@ export function createGatewayClient({ baseUrl, token, profile = 'default', socke
       historyReads.add(stop);
       const timer = setTimeout(() => { controller.abort(); rejectRead(new Error('Hermes 历史读取超时')); }, timeoutMs);
       const read = async () => {
-        const messages = [];
+        const messages = [], snapshotRecords = [];
         const rowIds = new Set();
         for (let page = 0; page < 100; page++) {
           const offset = page * 500;
@@ -228,10 +228,14 @@ export function createGatewayClient({ baseUrl, token, profile = 'default', socke
             const message = historyMessage(row);
             if (rowIds.has(row.id)) throw new Error('Hermes 历史行重复');
             rowIds.add(row.id);
+            if (captureSnapshotRecords) {
+              if (!['user', 'assistant', 'system', 'tool'].includes(row.role) || typeof row.content !== 'string') throw new Error('Hermes 快照源行不兼容');
+              snapshotRecords.push(row);
+            }
             if (message) messages.push(message);
           }
           // Official REST projection is one-to-one, even for hidden/tool rows.
-          if (pagination.returned < 500) return { count: messages.length, messages };
+          if (pagination.returned < 500) return { count: messages.length, messages, ...(captureSnapshotRecords ? { snapshotRecords } : {}) };
         }
         throw new Error('Hermes 历史超过读取上限');
       };

@@ -6,6 +6,18 @@ import { WorkStore } from '../src/work/store.ts';
 const root = '20260923140000-abcdef0';
 const external = '20260923140001-abcdef0';
 
+test('external-document link checks its scene after async validation and inside the serialized queue',async()=>{
+ const f=fixture();await f.service.createFromDocument({documentId:root,goal:'目标',approved:true});let current=true;
+ const title=f.host.getDocumentTitle;f.host.getDocumentTitle=async(id:string)=>{if(id===external)current=false;return title(id);};
+ await assert.rejects((f.service.linkExternalDocument as any)(root,external,true,()=>{if(!current)throw Error('文档已变化');}),/变化/);assert.deepEqual(await f.service.listExternalDocuments(root),[]);
+ f.host.getDocumentTitle=title;await assert.rejects((f.service.linkExternalDocument as any)(root,external,true,()=>{throw Error('排队期间已离开');}),/离开/);assert.deepEqual(await f.service.listExternalDocuments(root),[]);
+});
+test('external-document final target validation rejects changed metadata before appending',async()=>{
+ const f=fixture();await f.service.createFromDocument({documentId:root,goal:'目标',approved:true});
+ await assert.rejects((f.service.linkExternalDocument as any)(root,external,true,()=>{},async()=>{throw Error('所选 Work 已变化');}),/Work 已变化/);
+ assert.deepEqual(await f.service.listExternalDocuments(root),[]);
+});
+
 test('状态操作仅在明确确认且目标状态仍相符时写入，保留文档块及关联',async()=>{
   const f=fixture();f.attrs.set(root,{'custom-ai-work-v0':'1','custom-ai-work-status':'active'});f.children.set(root,['original-block']);
   await f.store.registerWork(root);await f.store.linkTask({workId:root,taskId:'task',connectionId:'siyuan-native-local'});

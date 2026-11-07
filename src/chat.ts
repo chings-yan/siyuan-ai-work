@@ -2,7 +2,7 @@ import type { Snapshot } from './core.ts';
 import type { Reference } from './references.ts';
 import type { ChatAdapter, ChatState } from './work/store.ts';
 
-export type ChatMessage = { id:string; role:'user'|'assistant'; content:string; references:Reference[]; snapshot?: Pick<Snapshot,'documentId'|'focusBlockId'|'nearby'>; status?:'complete'|'cancelled'|'error' };
+export type ChatMessage = { id:string; remoteMessageId?:string; role:'user'|'assistant'; content:string; references:Reference[]; snapshot?: Pick<Snapshot,'documentId'|'focusBlockId'|'nearby'>; status?:'complete'|'cancelled'|'error' };
 export type ChatThread = { id:string; storedSessionId?:string; adapter:ChatAdapter; state:ChatState; profile:string; installId?:string; legacyBridgeUrl?:string; hermesSessionId?:string; documentRootId:string; connectionId?:string; title:string; messages:ChatMessage[]; createdAt:string; };
 export type TransportMessage = { role:'user'|'assistant'; content:string };
 let seq=0;

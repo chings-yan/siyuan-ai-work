@@ -15,6 +15,7 @@ const windowsEntries = ['prepare-bridge.cmd', 'start-bridge.cmd'];
 const runtimeSources = [
   'bridge.mjs', 'bridge-supervisor.mjs', 'pair.mjs', 'bridge-config.mjs', 'bridge-metadata.mjs', 'studio-client.mjs',
   'ekko-routes.mjs', 'ekko-auth.mjs', 'ekko-private-file.mjs', 'ekko-room-client.mjs',
+  'hermes-session-runs.mjs', 'hermes-session-run-record.mjs', 'hermes-history-snapshot.mjs',
 ];
 async function fixture() {
   await mkdir(cache, { recursive: true });
@@ -267,7 +268,7 @@ try {
     assert.equal(rejectedOrigin.body.meta, undefined);
   }
   assert.deepEqual(await request('/connections', { 'X-Siyuan-Collab-Token': 'f'.repeat(64) }), {status:200,body:{data:[],meta:{
-    schemaVersion:1,bridgeVersion:process.env.TEST_BUILD_VERSION,capabilities:['hermes-connection-inspection-v1','ekko-authorization-record-v1'],
+    schemaVersion:1,bridgeVersion:process.env.TEST_BUILD_VERSION,capabilities:['hermes-connection-inspection-v1','ekko-authorization-record-v1','hermes-shared-session-v1','hermes-history-snapshot-v1'],
   }}});
   assert.deepEqual(await request('/ekko/connection', { 'X-Siyuan-Collab-Token': 'f'.repeat(64) }), { status: 200, body: { connection: null } });
   assert.equal(await fsp.readFile(join(state, 'settings-sentinel'), 'utf8'), 'unchanged isolated settings');
@@ -317,7 +318,7 @@ for(const api of [fs,fsp])for(const name of ['readFile','readFileSync','writeFil
 net.Server.prototype.listen=blocked;net.Socket.prototype.connect=blocked;globalThis.fetch=blocked;
 syncBuiltinESMExports();
 const {bridgeMetadata}=await import(source);
-const expected={schemaVersion:1,bridgeVersion:null,capabilities:['hermes-connection-inspection-v1','ekko-authorization-record-v1']};
+const expected={schemaVersion:1,bridgeVersion:null,capabilities:['hermes-connection-inspection-v1','ekko-authorization-record-v1','hermes-shared-session-v1','hermes-history-snapshot-v1']};
 assert.deepEqual(bridgeMetadata(),expected);
 const changed=bridgeMetadata();changed.capabilities.push('untrusted');changed.bridgeVersion='77.66.55';
 assert.deepEqual(bridgeMetadata(),expected);

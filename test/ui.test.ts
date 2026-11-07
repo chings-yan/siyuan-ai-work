@@ -160,7 +160,8 @@ test('messages retain flexible independent scrolling and bottom composer when st
   const css=(e:Element)=>dom.window.getComputedStyle(e);
   assert.equal(css(shell).display,'flex');assert.equal(css(shell).flexDirection,'column');
   for(const hidden of [true,false]){d.querySelector<HTMLElement>('[data-status-alert]')!.hidden=hidden;assert.equal(css(main).overflow,'auto');assert.equal(css(main).flexGrow,'1');assert.equal(css(composer).flexShrink,'0');}
-  assert.equal(d.querySelector('.sac-header')!.children.length,2);dom.window.close();
+  assert.deepEqual([...d.querySelector('.sac-header')!.children].map(el=>el.className),['sac-header-primary','sac-dock-tabs','sac-header-secondary']);
+  assert.deepEqual([...d.querySelectorAll('[data-dock-tab]')].map(el=>el.getAttribute('aria-label')),['对话','文档关联','知识检索']);dom.window.close();
 });
 
 test('Studio picker titles stay on one ellipsized line while full title and preview remain searchable', () => {

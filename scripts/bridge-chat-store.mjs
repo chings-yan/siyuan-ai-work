@@ -1,6 +1,7 @@
 import { readFile, writeFile, mkdir, rename, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { assertSessionRun } from './hermes-session-run-record.mjs';
 import { readBindings } from './studio-client.mjs';
 
 const queues = new Map();
@@ -24,6 +25,7 @@ function assertValidBindings(value) {
       || !(row.installId === null || (typeof row.installId === 'string' && row.installId))
       || !(row.anchor === null || (row.anchor && typeof row.anchor.messageId === 'string' && /^[0-9a-f]{64}$/.test(row.anchor.sha256)))
       || (row.state === 'ready' && !row.storedSessionId)) throw new Error('Bridge v2 绑定数据格式错误；已停止写入');
+    if (Object.hasOwn(row, 'run')) assertSessionRun(row.run, row, key, 'v2');
   }
   return value;
 }
@@ -72,6 +74,7 @@ export async function mutateLegacyBindings(file, transform) {
     const current = await readBindings(file);
     const next = await transform(current);
     if (next === undefined) return;
+    for (const [key, row] of Object.entries(next)) if (row && Object.hasOwn(row, 'run')) assertSessionRun(row.run, row, key, 'legacy');
     const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
     await mkdir(dirname(file), { recursive: true });
     try {

@@ -1,10 +1,15 @@
 import pluginManifest from '../plugin.json';
+import { CheckedPluginStorage } from './work/plugin-storage.ts';
 import { workStatusLabels, workStatusDescriptions } from './work/status-ui.ts';
 import { documentLinkConfirmation } from './work/document-link.ts';
 import { STUDIO_PARTIAL_READ_NOTICE,BridgeInspectionError,inspectLocalBridge,detectLocalBridge,EkkoSettingsConnection,validatedConnections,validConnectionId,connectionLabel,connectionAdvice,type BridgeInspection,type BridgeSettingsInput } from './work/connection-settings.ts';
+import {parseCompanionMetadata,type CompanionMetadata} from './work/connection-report.ts';
 import { bindDismissibleMenu } from './work/dismissible-menu.ts';
 import { SettingsDialog } from './work/settings-dialog.ts';
 import { WorkQuickPicker } from './work/quick-picker.ts';
+import { DocumentTaskLinks } from './task/document-links.ts';
+import { DocumentAssociations } from './work/document-association.ts';
+import { DocumentAssociationPanel } from './work/document-panel.ts';
 import { WorkGoalForm } from './work/goal-form.ts';
 import { WorkCreateForm, WORK_CREATE_CSS } from './work/create-form.ts';
 import { WorkCreator } from './work/create.ts';
@@ -12,6 +17,11 @@ import { WorkNativeTab } from './work/native-tab.ts';
 import { WorkPage, WORK_PAGE_CSS, type WorkPageContext, type WorkPageRoute } from './work/page.ts';
 import { WorkCatalog } from './work/catalog.ts';
 import { SessionMemory, sessionChoices, sessionKey, sessionLabel, sessionDetails, stableChatTitle, type SessionChoice, type SessionChat, type HermesDraft } from './work/sessions.ts';
+import {TaskDraftPanel,TASK_DRAFT_CSS} from './task/draft-panel.ts';
+import type {TaskDraftSource} from './task/draft.ts';
+import {AnswerAdoptionController,adoptionDigest,type AdoptionSource} from './work/answer-adoption.ts';
+import {SiYuanAnswerAdoptionNative} from './work/answer-adoption-native.ts';
+import {AnswerAdoptionPanel} from './work/answer-actions.ts';
 import { TaskDialog } from './task/dialog.ts';
 import { NativeTaskAdapter } from './task/native.ts';
 import type { RoomDraft } from './ekko/ui.ts';
@@ -20,9 +30,17 @@ import { Plugin, getAllEditor, openTab } from 'siyuan';
 import { buildSnapshot, parseKramdownResponse, isValidDocumentRootId, type Snapshot } from './core.ts';
 import { extractEditorContext, enrichEditorContext, selectActiveEditor, readEditorDocumentTitle } from './editor-context.ts';
 import { streamThreadChat } from './provider.ts';
-import { DEFAULT_BRIDGE_URL, checkedBridgeUrl, BridgeError, validatedStudioReadWarning, createBridgeClient, bridgeMessagesToChat, readThreadMessages, resolveBridgeUrl, type ConnectionView, type ChatView } from './bridge.ts';
+import { DEFAULT_BRIDGE_URL, checkedBridgeUrl, BridgeError, BridgeRunRejectedError, bridgeErrorDiagnostic, validatedStudioReadWarning, createBridgeClient, bridgeMessagesToChat, readThreadMessages, resolveBridgeUrl, type ConnectionView, type ChatView } from './bridge.ts';
 import { CSS } from './styles.ts';
 import { ReferenceBasket } from './references.ts';
+import { ReplyActivityStore, ReplyActivityPanel, REPLY_ACTIVITY_CSS, type ReplyActivity } from './work/reply-activity.ts';
+import {KnowledgePanel,knowledgePanelCss,type KnowledgeScopeChoice} from './knowledge/panel.ts';
+import {freezeKnowledgeScope,type KnowledgeScope,type KnowledgeDocument} from './knowledge/scope.ts';
+import {boundedKnowledgeRead,type KnowledgeBlock} from './knowledge/search.ts';
+import {ReplySyncController,pairedBridgeNamespace} from './work/reply-sync.ts';
+import {ReplySyncPanel,REPLY_SYNC_CSS} from './work/reply-sync-panel.ts';
+import {HERMES_HISTORY_SNAPSHOT_CAPABILITY} from './bridge.ts';
+import { REFERENCE_PREVIEW_CSS } from './work/reference-preview.ts';
 import { appendAssistantTurn, appendUserTurn, upsertAssistantTurn, newThread, switchThread, type ChatThread } from './chat.ts';
 import { applyGeneratingState, applyMentionSelection, bindComposerResize, clampMentionIndex, createChatShell, filterMentionCandidates, isSendKey, mentionKeyAction, mentionQueryAtCursor, prepareOutgoingMessage, renderChatConnection, renderConnectionChoices, renderEmptyStateMarkup, renderMentionPickerMarkup, renderMessageMarkup, renderReferenceBasketMarkup } from './ui.ts';
 import { mountStudioPicker, renderStudioSessionOptions } from './studio-picker.ts';
@@ -34,19 +52,34 @@ import { SiYuanWorkHost } from './work/siyuan-host.ts';
 import { WorkController, WORK_CSS, type ContextChoice } from './work/controller.ts';
 import { buildContextPayload, refreshSelection, freezeRequest } from './work/context.ts';
 import { parseProposal } from './work/proposal.ts';
-import { NativeTaskReader } from './task/reader.ts';
+import { NativeTaskReader, type TaskLookup } from './task/reader.ts';
+import { NativeTaskEditor } from './task/edit.ts';
+import { taskCompletionReminder } from './task/presentation.ts';
 import { applyApprovedProposal, WriteFailure, type FrozenProposal } from './work/write.ts';
 
 import { RoomLinkStore } from './work/room-store.ts';
 import { EkkoBridgeClient } from './ekko/bridge.ts';
-import { EkkoRoomUI, type RoomSourceOption } from './ekko/ui.ts';
+import { EkkoRoomUI, type RoomSourceOption, type RoomAnswerSource } from './ekko/ui.ts';
 import type { SelectedRoomSource } from './ekko/context.ts';
 import { PendingRoomSendStore } from './ekko/pending.ts';
 
 declare const window:any;
 export default class SiyuanAICollab extends Plugin {
- private dock:any; private floatingPanel?:HTMLElement; private styleElement?:HTMLStyleElement; private snapshot:Snapshot|null=null; private pendingProposal:FrozenProposal|null=null; private proposalNeedsReview=false; private recentBlockIds:string[]=[]; private observer?:MutationObserver; private bridgeUrl=DEFAULT_BRIDGE_URL; private bridgeToken=''; private connectionText='Bridge 未配对'; private connectionOk=false; private connectionViews:ConnectionView[]=[]; private selectedConnectionId='serve-local'; private confirmedConnectionId?:string; private workLoadSeq=0; private newChatInFlight=false; private associationOpen=false; private associationRoot?:HTMLElement; private associationOverlay?:HTMLElement; private associationGeneration=0; private activeBindingKeys=new Set<string>(); private references=new ReferenceBasket(); private quoteSeq=0; private threads:ChatThread[]=[]; private activeThreadId=''; private pendingPinsByThread=new Map<string,ContextRef[]>(); private abortController?:AbortController; private sendInFlight=false; private activeRunPhase:'preparing'|'submitting'|null=null; private preSubmitCancelled=false; private activeRunChatId=''; private activeRunBridge?:{chatId:string;documentRootId:string;bridgeUrl:string;capabilityToken:string}; private mentionIndex=0; private mentionOpen=false; private reconnectController?:ReconnectController;
+ private dock:any; private floatingPanel?:HTMLElement; private styleElement?:HTMLStyleElement; private snapshot:Snapshot|null=null; private pendingProposal:FrozenProposal|null=null; private proposalNeedsReview=false; private recentBlockIds:string[]=[]; private observer?:MutationObserver; private bridgeUrl=DEFAULT_BRIDGE_URL; private bridgeToken=''; private connectionText='Bridge 未配对'; private connectionOk=false; private connectionViews:ConnectionView[]=[]; private selectedConnectionId='serve-local'; private confirmedConnectionId?:string; private workLoadSeq=0; private newChatInFlight=false; private associationOpen=false; private associationRoot?:HTMLElement; private associationOverlay?:HTMLElement; private associationGeneration=0; private activeBindingKeys=new Set<string>(); private references=new ReferenceBasket(); private quoteSeq=0; private threads:ChatThread[]=[]; private activeThreadId=''; private pendingPinsByThread=new Map<string,ContextRef[]>(); private abortController?:AbortController; private sendInFlight=false; private activeRunPhase:'preparing'|'submitting'|null=null; private preSubmitCancelled=false; private activeRunChatId=''; private activeRunBridge?:{chatId:string;documentRootId:string;bridgeUrl:string;capabilityToken:string;runId?:string}; private mentionIndex=0; private mentionOpen=false; private reconnectController?:ReconnectController;
  private readonly sessionMemory = new SessionMemory();
+ private readonly replyActivities=new ReplyActivityStore();
+ private readonly activityPanels=new Map<HTMLElement,ReplyActivityPanel>();
+ private answerAdoption?:AnswerAdoptionController;
+ private readonly adoptionPanels=new Map<HTMLElement,AnswerAdoptionPanel>();
+ private readonly adoptionSources=new Map<HTMLElement,{key:string;current:()=>boolean}>();
+ private readonly taskDraftPanels=new Map<HTMLElement,TaskDraftPanel>();
+ private readonly workflowSourceGuards=new Map<HTMLElement,Map<string,()=>boolean>>();
+ private readonly knowledgePanels=new Map<HTMLElement,KnowledgePanel>();
+ private readonly replySyncPanels=new Map<HTMLElement,ReplySyncPanel>();
+ private readonly workflowStorage=new CheckedPluginStorage({appId:()=>{const id=(this.app as any)?.appId;if(typeof id!=='string'||!id)throw Error('宿主存储身份尚未就绪，请重新打开插件');return id;},onSaved:(key,value)=>{this.data??={};this.data[key]=structuredClone(value);}});
+ private readonly replySync=new ReplySyncController({storage:{loadData:key=>this.workflowStorage.loadData(key),saveData:(key,value)=>this.workflowStorage.saveData(key,value)},captureSource:async()=>{const url=this.bridgeUrl,token=this.bridgeToken;if(!token)return null;const namespace=await pairedBridgeNamespace(url,token);return {namespace,isCurrent:()=>!this.disposed&&this.bridgeUrl===url&&this.bridgeToken===token};},listTargets:async()=>{const links=await this.workStore.listAllChatsReadOnly(this.workflowStorage);return {links,unresolvedCount:links.filter(link=>link.adapter==='unresolved'||link.state!=='ready').length};},isTargetCurrent:link=>this.replyTargetCurrent(link),readSnapshot:(link,signal)=>this.readReplySnapshot(link,signal)});
+ private companionEvidence?:{url:string;token:string;metadata:CompanionMetadata|null};
+ private sharedSessionCapable(){const evidence=this.companionEvidence;return evidence?.url===this.bridgeUrl&&evidence.token===this.bridgeToken&&evidence.metadata?.capabilities.includes('hermes-shared-session-v1')===true;}
  private chatScopePreparationVersion=0;
  private disposed=false; private preparing=false; private accepting=false; private historyVersion=0; private snapshotVersion=0; private chatReadStatus?:{chatId:string;connection:string;ready:boolean};
   private historyFailure:{workId:string|null;connection:string;chatId:string;documentRootId:string}|null=null;
@@ -67,6 +100,10 @@ export default class SiyuanAICollab extends Plugin {
  private readonly workHost = new SiYuanWorkHost((path, body) => this.api(path, body));
  private readonly workService = new WorkService(this.workHost, this.workStore);
  private readonly taskReader = new NativeTaskReader();
+ private readonly documentTaskLinks=new DocumentTaskLinks({loadData:key=>this.loadData(key),saveData:(key,value)=>this.saveData(key,value)});
+ private readonly documentAssociations=new DocumentAssociations({currentDocumentId:()=>this.currentDocumentId(),isBusy:()=>this.disposed||this.chatBusy()||Boolean(this.pendingProposal)||this.workController.isTransitioning||this.ekkoSettings.isPairing||[...this.roomViews.values()].some(view=>view.isSending),taskLinks:this.documentTaskLinks,taskReader:this.taskReader,store:this.workStore,host:this.workHost,service:this.workService});
+ private readonly documentPanels=new Map<HTMLElement,DocumentAssociationPanel>();
+ private readonly nativeTaskEditor = new NativeTaskEditor(this.app,this.taskReader);
  private readonly nativeTaskAdapter = new NativeTaskAdapter(this.app,{getAllEditor});
  private readonly taskDialog = new TaskDialog(document,{native:this.nativeTaskAdapter,reader:this.taskReader,controller:{checkSelectableTask:(taskId,workId)=>this.workController.checkSelectableTask(taskId,workId),linkSelectedTask:(workId,task,current)=>this.workController.linkSelectedTask(workId,task,current)},documentTitle:id=>this.workHost.getDocumentTitle(id),readWork:id=>this.workService.readWork(id),listWorks:async()=>Promise.all((await this.workStore.listWorks()).map(async id=>({id,title:await this.workHost.getDocumentTitle(id)})))});
  private readonly workCreator = new WorkCreator(this.workHost,this.workStore,this.workService,this.taskReader);
@@ -76,6 +113,8 @@ export default class SiyuanAICollab extends Plugin {
  private settingsDialog?: SettingsDialog;
  private settingsSaving=false;
  private lastSettingsInspection:BridgeInspection|null=null;
+ // Local-only scope evidence; credentials never enter inspection reports or presentation.
+ private settingsInspectionScopes=new WeakMap<BridgeInspection,{url:string;token:string;connectionId:string|undefined}>();
  private lastSettingsSaveOutcome:BridgeInspection['saveOutcome'];
  private settingsReportVersion=0;
  private lastSettingsReportVersion=0;
@@ -98,11 +137,11 @@ export default class SiyuanAICollab extends Plugin {
    canBrowseDocuments: () => this.activeRunPhase==='submitting' && Boolean(this.abortController) && !this.preparing && !this.accepting && !this.settingsSaving,
    openDocument: (id, focus) => openTab({ app: this.app, doc: { id: focus || id, action: focus ? ['cb-get-focus'] : [] } }),
    onWorkChanged: async id => { await this.onWorkChanged(id); await Promise.all([...this.roomViews.values()].map(view => view.workChanged())); }, onLinkCurrentChat: () => this.linkCurrentChat(), status: message => document.querySelectorAll<HTMLElement>('.sac').forEach(root => this.setStatus(root, message)) });
- private readonly onProtyleSwitch = () => { void this.workController.refreshFromEditor().then(() => this.roomViews.forEach(view => void view.documentChanged())); };
+ private readonly onProtyleSwitch = () => { this.documentPanels.forEach(panel=>panel.documentChanged());this.knowledgePanels.forEach(panel=>panel.documentChanged());void this.workController.refreshFromEditor().then(() => this.roomViews.forEach(view => void view.documentChanged())); };
  private readonly onEditorActivity = (event: Event) => { if ((event.target as Element)?.closest?.('.protyle')) this.workController.noteFocus(); };
- onload(){ this.workTab=new WorkNativeTab(this,openTab,(element,context)=>this.mountWorkPage(element,context)); this.addIcons('<symbol id="iconSiyuanAICollab" viewBox="0 0 32 32"><path d="M6 5h4v9h12V5h4v22h-4v-9H10v9H6V5Z"/><path d="m27 1 1 2 2 1-2 1-1 2-1-2-2-1 2-1 1-2Z"/></symbol>'); const style=document.createElement('style');style.textContent=CSS+'\n'+WORK_CSS+'\n'+WORK_PAGE_CSS+'\n'+WORK_CREATE_CSS;document.head.appendChild(style);this.styleElement=style; const plugin=this; this.reconnectController=new ReconnectController({hasToken:()=>Boolean(plugin.bridgeToken),refresh:()=>plugin.syncHermesSessions(),onFailure:error=>plugin.updateConnectionUI(false,error),onSuccess:()=>plugin.updateConnectionUI(true)}); this.dock=this.addDock({config:{position:'RightTop',size:{width:360,height:360},title:'思源 AI 即时协作',icon:'iconSiyuanAICollab'},data:{},type:'siyuan-ai-collab',init:function(this:any){plugin.render(this.element);},destroy:function(this:any){plugin.disposeRoomView(this.element);}}); void this.restoreConnectionSettings().catch(error=>plugin.updateConnectionUI(false,error)); this.observer=new MutationObserver(m=>{for(const x of m){const b=(x.target as Element).closest?.('[data-node-id]');const id=b?.getAttribute('data-node-id');if(id)this.recentBlockIds=[id,...this.recentBlockIds.filter(v=>v!==id)].slice(0,20);}});this.observer.observe(document.body,{subtree:true,childList:true,characterData:true});this.eventBus.on('switch-protyle',this.onProtyleSwitch);document.addEventListener('pointerup',this.onEditorActivity,true);document.addEventListener('keyup',this.onEditorActivity,true);window.setTimeout(()=>{if(!this.disposed)void this.workController.refreshFromEditor();},0); }
+ onload(){ this.workTab=new WorkNativeTab(this,openTab,(element,context)=>this.mountWorkPage(element,context)); this.addIcons('<symbol id="iconSiyuanAICollab" viewBox="0 0 32 32"><path d="M6 5h4v9h12V5h4v22h-4v-9H10v9H6V5Z"/><path d="m27 1 1 2 2 1-2 1-1 2-1-2-2-1 2-1 1-2Z"/></symbol>'); const style=document.createElement('style');style.textContent=CSS+'\n'+WORK_CSS+'\n'+WORK_PAGE_CSS+'\n'+WORK_CREATE_CSS+'\n'+REPLY_ACTIVITY_CSS+'\n'+REFERENCE_PREVIEW_CSS+'\n'+knowledgePanelCss+'\n'+REPLY_SYNC_CSS+'\n'+TASK_DRAFT_CSS;document.head.appendChild(style);this.styleElement=style; const plugin=this; this.reconnectController=new ReconnectController({hasToken:()=>Boolean(plugin.bridgeToken),refresh:()=>plugin.syncHermesSessions(),onFailure:error=>plugin.updateConnectionUI(false,error),onSuccess:()=>plugin.updateConnectionUI(true)}); this.dock=this.addDock({config:{position:'RightTop',size:{width:360,height:360},title:'思源 AI 即时协作',icon:'iconSiyuanAICollab'},data:{},type:'siyuan-ai-collab',init:function(this:any){plugin.render(this.element);},destroy:function(this:any){plugin.disposeRoomView(this.element);}}); void this.restoreConnectionSettings().catch(error=>plugin.updateConnectionUI(false,error)); this.observer=new MutationObserver(m=>{for(const x of m){const b=(x.target as Element).closest?.('[data-node-id]');const id=b?.getAttribute('data-node-id');if(id)this.recentBlockIds=[id,...this.recentBlockIds.filter(v=>v!==id)].slice(0,20);}});this.observer.observe(document.body,{subtree:true,childList:true,characterData:true});this.eventBus.on('switch-protyle',this.onProtyleSwitch);document.addEventListener('pointerup',this.onEditorActivity,true);document.addEventListener('keyup',this.onEditorActivity,true);window.setTimeout(()=>{if(!this.disposed)void this.workController.refreshFromEditor();},0); }
  onLayoutReady(){this.addTopBar({icon:'iconSiyuanAICollab',title:'思源 AI Work',position:'right',callback:()=>{void this.openWorkPage({kind:'home'});}});}
-  onunload(){this.disposed=true;this.settingsDialog?.dispose();++this.workLoadVersion;++this.historyVersion;this.closeAssociation();this.closeRoomAssociation?.();this.workCreateForm.dispose();this.workGoalForm.dispose();this.taskDialog.dispose();this.workTab?.dispose();this.workTab=undefined;this.reconnectController?.unload();this.observer?.disconnect();this.styleElement?.remove();this.eventBus.off('switch-protyle',this.onProtyleSwitch);document.removeEventListener('pointerup',this.onEditorActivity,true);document.removeEventListener('keyup',this.onEditorActivity,true);void this.workController.flushResume().catch(()=>undefined);this.workController.detach();for(const root of [...this.roomViews.keys()])this.disposeRoomView(root);this.floatingPanel?.remove();this.references.clear();this.threads=[];this.dock=undefined;}
+  onunload(){this.disposed=true;this.replySync.dispose();this.settingsDialog?.dispose();++this.workLoadVersion;++this.historyVersion;this.closeAssociation();this.closeRoomAssociation?.();this.workCreateForm.dispose();this.workGoalForm.dispose();this.taskDialog.dispose();this.workTab?.dispose();this.workTab=undefined;this.reconnectController?.unload();this.observer?.disconnect();this.styleElement?.remove();this.eventBus.off('switch-protyle',this.onProtyleSwitch);document.removeEventListener('pointerup',this.onEditorActivity,true);document.removeEventListener('keyup',this.onEditorActivity,true);void this.workController.flushResume().catch(()=>undefined);this.workController.detach();for(const root of [...this.roomViews.keys()])this.disposeRoomView(root);this.floatingPanel?.remove();this.references.clear();this.threads=[];this.dock=undefined;}
  private toggleFloatingPanel(){const existing=document.getElementById('siyuan-ai-collab-panel');if(existing){this.disposeRoomView(existing);existing.remove();this.floatingPanel=undefined;return;}const panel=document.createElement('aside');panel.id='siyuan-ai-collab-panel';panel.className='sac-floating';document.body.appendChild(panel);this.floatingPanel=panel;this.render(panel);}
  private bridgeClient(documentRootId:string){return createBridgeClient({bridgeUrl:this.bridgeUrl,capabilityToken:this.bridgeToken},documentRootId);}
  private threadFromLink(link:ChatLink,previous?:ChatThread):ChatThread{return {id:link.chatId,storedSessionId:link.storedSessionId||undefined,hermesSessionId:link.state==='ready'?link.storedSessionId||undefined:undefined,adapter:link.adapter,state:link.state,profile:link.profile,installId:link.installId||undefined,legacyBridgeUrl:link.legacyBridgeUrl,documentRootId:link.documentRootId,connectionId:link.connectionId,title:link.title,messages:previous?.messages||[],createdAt:previous?.createdAt||new Date().toISOString()};}
@@ -116,14 +155,36 @@ export default class SiyuanAICollab extends Plugin {
   private setChatMenuOpen(root:HTMLElement,open:boolean){const menu=root.querySelector<HTMLElement>('[data-chat-menu]'),button=root.querySelector<HTMLButtonElement>('[data-action="chat-actions-menu"]');if(!menu||!button)return;const next=open&&!this.associationOpen;menu.hidden=!next;button.setAttribute('aria-expanded',String(next));if(next)menu.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();}
   private setAssociationOpen(root:HTMLElement,open:boolean){this.associationOpen=open;if(open){this.associationRoot=root;this.setChatMenuOpen(root,false);}else if(this.associationRoot===root)this.associationRoot=undefined;document.querySelectorAll<HTMLButtonElement>('.sac [data-action="associate-studio"],.sac [data-action="chat-actions-menu"]').forEach(button=>button.disabled=open);}
  private invalidateAssociationFor(root?:HTMLElement){if(!root||this.associationRoot!==root)return;this.associationGeneration++;this.associationOverlay?.remove();this.associationOverlay=undefined;this.setAssociationOpen(root,false);}
- private async priorUnknownCandidate(workId:string|null,documentRootId:string,connectionId:string,storedSessionId:string):Promise<{chatId:string;state:string}|null>{
+ private async priorUnknownCandidate(workId:string|null,documentRootId:string,connection:ConnectionView,storedSessionId:string):Promise<{chatId:string;state:string;link?:ChatLink}|null>{
   const links=workId?await this.workStore.listChats(workId):await this.workStore.listDocumentChats(documentRootId);
-  const formal=links.find(link=>link.documentRootId===documentRootId&&link.connectionId===connectionId&&link.storedSessionId===storedSessionId);
-  if(formal)return {chatId:formal.chatId,state:formal.state};
+  const formal=links.find(link=>link.documentRootId===documentRootId&&link.connectionId===connection.id&&link.adapter===connection.kind&&link.profile===connection.profile&&link.installId===connection.installId&&link.storedSessionId===storedSessionId&&(!link.legacyBridgeUrl||link.legacyBridgeUrl===this.bridgeUrl));
   const pending=await this.workStore.listPending();
-  const markers=[`connectionId=${connectionId}`,`documentRootId=${documentRootId}`,`storedSessionId=${storedSessionId}`];
+  const markers=[`connectionId=${connection.id}`,`documentRootId=${documentRootId}`,`storedSessionId=${storedSessionId}`];
   const unresolved=pending.find(item=>item.kind==='chat'&&item.workId===workId&&item.state==='unknown'&&markers.every(marker=>item.details.split(/\s+/).includes(marker)));
-  return unresolved?{chatId:unresolved.id.replace(/^chat:/,''),state:'unknown'}:null;
+  return unresolved?{chatId:unresolved.id.replace(/^chat:/,''),state:'unknown'}:formal?{chatId:formal.chatId,state:formal.state,link:formal}:null;
+ }
+ private async recoverSharedCandidate(workId:string|null,documentRootId:string,connection:ConnectionView,storedSessionId:string,client:ReturnType<typeof createBridgeClient>,current:()=>boolean):Promise<{chatId:string;state:string;link?:ChatLink}|null>{
+  const {data}=await client.listChats(connection.id);
+  if(!current())return null;
+  if(!Array.isArray(data))throw Error('Bridge 关联列表无效，请核对');
+  const exact=data.filter(chat=>chat&&chat.documentRootId===documentRootId&&chat.connectionId===connection.id&&chat.kind===connection.kind&&chat.profile===connection.profile&&chat.installId===connection.installId&&chat.storedSessionId===storedSessionId);
+  if(exact.length>1)throw Error('同文档存在多个会话入口，请核对原关系');
+  const chat=exact[0];if(!chat)return null;
+  if(typeof chat.chatId!=='string'||!chat.chatId||typeof chat.title!=='string'||!chat.title||!['creating','pending','ready','unknown'].includes(chat.state))throw Error('Bridge 关联证据不完整，请核对');
+  if(chat.state!=='ready')return {chatId:chat.chatId,state:chat.state};
+  // Recheck local unknown evidence after the read; a successful GET never clears it.
+  const prior=await this.priorUnknownCandidate(workId,documentRootId,connection,storedSessionId);
+  if(!current())return null;
+  if(prior)return prior;
+  const existing=await this.workStore.chatLink(chat.chatId);
+  if(!current())return null;
+  if(existing)throw Error(`原 Chat ${chat.chatId} 已有正式归属，请核对原 Work`);
+  const link=this.chatLinkFromView(chat,workId);
+  try{await this.workStore.linkChat(link);}catch(error){
+   await this.workStore.setPending({id:`chat:${chat.chatId}`,kind:'chat',workId,state:'unknown',details:`关联读回后本地保存未确认；chatId=${chat.chatId} connectionId=${connection.id} documentRootId=${documentRootId} storedSessionId=${storedSessionId}`,updatedAt:new Date().toISOString()});
+   throw error;
+  }
+  return {chatId:chat.chatId,state:chat.state,link};
  }
   private async preserveUnstoredChat(root:HTMLElement,link:ChatLink,operation:string,showUi=true,activate=true):Promise<void>{
   const originScope=this.chatScopeKey(),originDocument=this.currentDocumentId(),originConnection=this.connectionIdentity(),originGeneration=this.workLoadSeq,originNavigation=this.workController.navigationVersion,originView=this.viewCleanup.get(root);
@@ -284,34 +345,59 @@ export default class SiyuanAICollab extends Plugin {
   let workId:string|null;
   try{workId=await preparation.scope;}catch(error){if(preparation.isCurrent())this.setScopePreparationStatus(root,error instanceof Error?error.message:String(error));return;}
   if(!preparation.isCurrent())return;
-  const originWorkId=this.workController.currentWorkId,originDocumentId=this.currentDocumentId(),bridgeUrl=this.bridgeUrl,bridgeToken=this.bridgeToken;
+  const originWorkId=this.workController.currentWorkId,originDocumentId=this.currentDocumentId(),bridgeUrl=this.bridgeUrl,bridgeToken=this.bridgeToken,selectedConnectionId=this.selectedConnectionId,confirmedConnectionId=this.confirmedConnectionId;
   if(!isValidDocumentRootId(documentRootId)){this.setStatus(root,'请先打开一个思源文档');return;}
   let connection:ConnectionView;
   try{connection=this.checkSelectedConnection();}catch(error){this.setStatus(root,error instanceof Error?error.message:String(error));return;}
-  const client=this.bridgeClient(documentRootId);
+  const client=this.bridgeClient(documentRootId),shared=this.sharedSessionCapable()&&connection.kind!=='legacy-api';
   const generation=++this.associationGeneration,navigation=this.workController.navigationVersion,sceneGeneration=this.workLoadSeq,originScope=this.chatScopeKey(),originView=this.viewCleanup.get(root);
   this.setAssociationOpen(root,true);
-  const sceneCurrent=()=>!this.disposed&&pageCurrent()&&this.workController.navigationVersion===navigation&&this.workLoadSeq===sceneGeneration&&this.chatScopeKey()===originScope&&this.viewCleanup.get(root)===originView&&root.isConnected&&this.bridgeUrl===bridgeUrl&&this.bridgeToken===bridgeToken&&this.workController.currentWorkId===originWorkId&&this.currentDocumentId()===originDocumentId;
+  const sceneCurrent=()=>!this.disposed&&pageCurrent()&&this.workController.navigationVersion===navigation&&this.workLoadSeq===sceneGeneration&&this.chatScopeKey()===originScope&&this.viewCleanup.get(root)===originView&&root.isConnected&&this.bridgeUrl===bridgeUrl&&this.bridgeToken===bridgeToken&&this.selectedConnectionId===selectedConnectionId&&this.confirmedConnectionId===confirmedConnectionId&&this.workController.currentWorkId===originWorkId&&this.currentDocumentId()===originDocumentId;
   const isCurrent=()=>sceneCurrent()&&this.associationRoot===root&&this.associationGeneration===generation;
+  const overlay=document.createElement('div');overlay.className='sac-studio-picker';
+  this.associationOverlay=overlay;
+  const closePicker=()=>{if(this.associationRoot===root&&this.associationGeneration===generation&&this.associationOverlay===overlay)this.invalidateAssociationFor(root);};
   try{
-   const overlay=document.createElement('div');overlay.className='sac-studio-picker';
-   this.associationOverlay=overlay;
-   const closePicker=()=>{if(this.associationRoot===root&&this.associationGeneration===generation&&this.associationOverlay===overlay)this.invalidateAssociationFor(root);};
-    overlay.innerHTML='<div role="dialog" aria-label="关联 Hermes 对话" tabindex="-1"><input data-studio-search aria-label="搜索 Hermes 对话" placeholder="搜索对话" disabled><small data-studio-read-warning hidden></small><div data-studio-options role="radiogroup" aria-label="Hermes 对话"><small data-studio-loading>正在读取可关联对话…</small></div><div class="sac-studio-actions"><button type="button" data-studio-cancel aria-label="取消关联">取消</button><button type="button" data-studio-confirm aria-label="确认关联" disabled>确认关联</button></div></div>';
+    overlay.innerHTML='<div role="dialog" aria-label="关联 Hermes 对话" tabindex="-1"><input data-studio-search aria-label="搜索 Hermes 对话" placeholder="搜索对话" disabled><div class="sac-studio-body"><small data-studio-read-warning hidden></small><div data-studio-options role="radiogroup" aria-label="Hermes 对话"><small data-studio-loading>正在读取可关联对话…</small></div><small data-studio-feedback role="status" aria-live="polite" hidden></small><details data-studio-diagnostic hidden><summary>诊断信息</summary><small data-studio-diagnostic-value></small></details></div><div class="sac-studio-actions"><button type="button" data-studio-cancel aria-label="取消关联">取消</button><button type="button" data-studio-confirm aria-label="确认关联" disabled>确认关联</button></div></div>';
    const options=overlay.querySelector<HTMLElement>('[data-studio-options]')!,search=overlay.querySelector<HTMLInputElement>('[data-studio-search]')!,confirm=overlay.querySelector<HTMLButtonElement>('[data-studio-confirm]')!,cancel=overlay.querySelector<HTMLButtonElement>('[data-studio-cancel]')!;
-    let sessions:Awaited<ReturnType<typeof client.listCandidates>>['data']=[],selected='',bindingInFlight=false;
-   const draw=()=>{options.innerHTML=renderStudioSessionOptions(sessions,search.value);options.querySelectorAll<HTMLInputElement>('input').forEach(input=>input.onchange=()=>{selected=input.value;if(!bindingInFlight)confirm.disabled=false;});};
+   if(shared){const notice=document.createElement('small');notice.textContent='多篇文档将共用这段对话历史；草稿与本轮资料各自保留。';overlay.querySelector('.sac-studio-body')!.prepend(notice);}
+   const offerReady=(prior:{chatId:string;link?:ChatLink})=>{closePicker();if(sceneCurrent()){this.showAssociatedChatAction(root,prior.chatId,workId,'这篇文档已关联此对话，点击“打开对话”继续。');const button=root.querySelector<HTMLButtonElement>('[data-action="open-associated-chat"]');if(button&&prior.link){const expected=prior.link;button.onclick=()=>this.openReadyAssociatedChat(root,expected,sceneCurrent);}}};
+   const diagnostic=overlay.querySelector<HTMLDetailsElement>('[data-studio-diagnostic]')!;
+   const feedback=(message:string,error=false,cause?:unknown)=>{if(!isCurrent()){closePicker();return;}const region=overlay.querySelector<HTMLElement>('[data-studio-feedback]')!;region.setAttribute('role',error?'alert':'status');region.setAttribute('aria-live',error?'assertive':'polite');region.textContent=message;region.hidden=false;this.setStatus(root,message);const info=bridgeErrorDiagnostic(cause);diagnostic.open=false;diagnostic.hidden=info.status===undefined&&!info.code;diagnostic.querySelector('[data-studio-diagnostic-value]')!.textContent=[info.status===undefined?'':`HTTP ${info.status}`,info.code||''].filter(Boolean).join(' · ');};
+   let sessions:Awaited<ReturnType<typeof client.listCandidates>>['data']=[],selected='',bindingInFlight=false;
+   const candidateErrors=new Map<string,{message:string;cause:unknown;blocked:boolean}>();
+   const showSelectionFeedback=()=>{if(!isCurrent())return;const saved=candidateErrors.get(selected);confirm.disabled=bindingInFlight||!selected||Boolean(saved?.blocked);if(bindingInFlight)return;if(saved)feedback(saved.message,true,saved.cause);else{overlay.querySelector<HTMLElement>('[data-studio-feedback]')!.hidden=true;diagnostic.hidden=true;this.setStatus(root,'');}};
+   const candidateError=(id:string,message:string,cause:unknown)=>{if(!isCurrent()){closePicker();return;}candidateErrors.set(id,{message,cause,blocked:cause instanceof BridgeError&&cause.status===409});showSelectionFeedback();};
+   const draw=()=>{options.innerHTML=renderStudioSessionOptions(sessions,search.value);options.querySelectorAll<HTMLInputElement>('input').forEach(input=>{input.checked=input.value===selected;input.onchange=()=>{selected=input.value;showSelectionFeedback();};});};
    search.oninput=draw;cancel.addEventListener('click',()=>{if(!bindingInFlight)closePicker();});
     overlay.addEventListener('keydown',event=>{if(event.key==='Escape'&&!bindingInFlight){event.preventDefault();closePicker();}});
    confirm.onclick=async()=>{
-    if(!isCurrent()||bindingInFlight||!selected||!sessions.some(session=>session.id===selected))return;
+    if(!isCurrent()){closePicker();return;}
+    if(bindingInFlight||!selected||candidateErrors.get(selected)?.blocked)return;
+    const candidate=sessions.find(session=>session.id===selected);if(!candidate)return;
+    const candidateId=candidate.id,candidateTitle=String(candidate.title||'Hermes 会话');
     bindingInFlight=true;confirm.disabled=true;cancel.disabled=true;
-    const bindingKey=`${workId}\u0000${documentRootId}\u0000${connection.id}\u0000${selected}`;
-    if(this.activeBindingKeys.has(bindingKey)){this.setStatus(root,'该会话关联仍在处理中，请等待原请求结果');bindingInFlight=false;confirm.disabled=false;cancel.disabled=false;return;}
-    try{const prior=await this.priorUnknownCandidate(workId,documentRootId,connection.id,selected);if(prior){if(isCurrent())this.setStatus(root,prior.state==='unknown'?`已有未决关联 Chat ID：${prior.chatId}，请先核对结果，不能为同一会话重新分配 ID。`:`该会话已关联 Chat ID：${prior.chatId}，请打开原 Chat，不能重复关联。`);bindingInFlight=false;confirm.disabled=false;cancel.disabled=false;return;}}
-    catch(error){if(isCurrent())this.setStatus(root,`未决关联检查失败，已阻止关联：${error instanceof Error?error.message:String(error)}`);bindingInFlight=false;confirm.disabled=false;cancel.disabled=false;return;}
-    if(!isCurrent()){bindingInFlight=false;return;}
-    const local=newThread(documentRootId,String(sessions.find(session=>session.id===selected)?.title||'Hermes 会话'));
+    feedback('正在确认关联，请等待原请求结果…');
+    const bindingKey=`${workId}\u0000${documentRootId}\u0000${connection.id}\u0000${candidateId}`;
+    if(this.activeBindingKeys.has(bindingKey)){feedback('该会话关联仍在处理中，请等待原请求结果');bindingInFlight=false;confirm.disabled=false;cancel.disabled=false;return;}
+    try{
+     let prior=await this.priorUnknownCandidate(workId,documentRootId,connection,candidateId);
+     if(!isCurrent()){closePicker();bindingInFlight=false;return;}
+     if(!prior&&shared)prior=await this.recoverSharedCandidate(workId,documentRootId,connection,candidateId,client,isCurrent);
+     if(!isCurrent()){closePicker();bindingInFlight=false;return;}
+     if(prior){
+      if(prior.state==='ready'){
+       offerReady(prior);
+      }else{
+       bindingInFlight=false;cancel.disabled=false;
+       candidateError(candidateId,prior.state==='unknown'?'上次关联结果待核对，请先核对原对话，勿重复关联。':'此对话已有关联，尚未就绪，请先核对原对话，勿重复关联。',undefined);return;
+      }
+      bindingInFlight=false;confirm.disabled=false;cancel.disabled=false;return;
+     }
+    }
+    catch(error){bindingInFlight=false;cancel.disabled=false;candidateError(candidateId,`未决关联检查失败，已阻止关联：${error instanceof Error?error.message:String(error)}`,error);return;}
+    if(!isCurrent()){closePicker();bindingInFlight=false;return;}
+    const local=newThread(documentRootId,candidateTitle);
     let attempted=false,responseSeen=false,formalSaved=false;
     let acceptedLink:ChatLink|undefined;
     try{
@@ -319,37 +405,48 @@ export default class SiyuanAICollab extends Plugin {
      if(!isCurrent())throw new Error('页面或连接已变化，请重新选择');
      attempted=true;
      this.activeBindingKeys.add(bindingKey);
-     const {chat}=await client.bindChat(local.id,connection.id,selected,local.title);
+     const {chat}=await client.bindChat(local.id,connection.id,candidateId,local.title);
      responseSeen=true;
-     if(chat.chatId!==local.id||chat.documentRootId!==documentRootId||chat.connectionId!==connection.id||chat.storedSessionId!==selected||chat.kind!==connection.kind||chat.profile!==connection.profile||chat.installId!==connection.installId)throw new Error('Bridge 关联响应与选择不符；请核对');
+     if(chat.chatId!==local.id||chat.documentRootId!==documentRootId||chat.connectionId!==connection.id||chat.storedSessionId!==candidateId||chat.kind!==connection.kind||chat.profile!==connection.profile||chat.installId!==connection.installId)throw new Error('Bridge 关联响应与选择不符；请核对');
      const link=this.chatLinkFromView(chat,workId);acceptedLink=link;await this.workStore.linkChat(link);formalSaved=true;
      const showUi=isCurrent();closePicker();
      if(!showUi)return;
       const thread=this.threadFromLink(link);if(this.chatScopeCurrent(workId,documentRootId)){this.threads.push(thread);this.rememberThreads();document.querySelectorAll<HTMLElement>('.sac').forEach(panel=>this.renderThreads(panel));}
       this.workTab?.refresh();this.showAssociatedChatAction(root,thread.id,workId,`对话已关联到${workId?'所选 Work':'当前文档'}；当前对话未切换。可点击“打开对话”或在上方选择。`);
     }catch(error){
+      if(shared&&error instanceof BridgeError&&error.status===409&&error.code==='session_claimed'&&isCurrent()){
+       try{
+        const recovered=await this.recoverSharedCandidate(workId,documentRootId,connection,candidateId,client,isCurrent);
+        if(!isCurrent()){closePicker();return;}
+        if(recovered?.state==='ready'){offerReady(recovered);return;}
+        if(recovered){bindingInFlight=false;cancel.disabled=false;candidateError(candidateId,'此对话已有关联，结果待核对，请先核对原对话，勿重复关联。',error);return;}
+       }catch(recoveryError){
+        bindingInFlight=false;cancel.disabled=false;
+        candidateError(candidateId,`已有会话入口，但读回未确认：${recoveryError instanceof Error?recoveryError.message:String(recoveryError)}；请核对原关联。`,error);return;
+       }
+      }
       if(acceptedLink&&!formalSaved){const showUi=isCurrent();closePicker();await this.preserveUnstoredChat(root,acceptedLink,'关联 Chat',showUi,false);return;}
      if(attempted&&(responseSeen||!(error instanceof BridgeError)||error.status>=500)){
-      const unknown:ChatLink={chatId:local.id,workId,documentRootId,connectionId:connection.id,adapter:connection.kind,profile:connection.profile,storedSessionId:selected,installId:connection.installId,title:local.title,state:'unknown'};
+      const unknown:ChatLink={chatId:local.id,workId,documentRootId,connectionId:connection.id,adapter:connection.kind,profile:connection.profile,storedSessionId:candidateId,installId:connection.installId,title:local.title,state:'unknown'};
        let showUi=false;
        try{await this.workStore.linkChat(unknown);showUi=isCurrent();closePicker();if(showUi&&this.chatScopeCurrent(workId,documentRootId)){this.threads.push(this.threadFromLink(unknown));this.rememberThreads();document.querySelectorAll<HTMLElement>('.sac').forEach(panel=>this.renderThreads(panel));}}
        catch{const showUi=isCurrent();closePicker();await this.preserveUnstoredChat(root,unknown,'关联 Chat',showUi,false);return;}
        // Closing the picker invalidates isCurrent; retain only this freshly checked result,
        // and keep the independent scene guard for any synchronous rendering callbacks.
-       if(showUi&&sceneCurrent())this.setStatus(root,`关联 Chat ${local.id} 结果需核对：${error instanceof Error?error.message:String(error)}；当前对话未切换，请勿重复确认。`);
+       if(showUi&&sceneCurrent())this.setStatus(root,'上次关联结果待核对，当前对话未切换；请先核对原对话，勿重复关联。');
        return;
-     }else if(!attempted||(error instanceof BridgeError&&error.status<500)){bindingInFlight=false;confirm.disabled=false;cancel.disabled=false;}
-      if(isCurrent())this.setStatus(root,`关联 Chat ${local.id} 结果需核对：${error instanceof Error?error.message:String(error)}；当前对话未切换，请勿重复确认。`);
+     }else if(!attempted||(error instanceof BridgeError&&error.status<500)){bindingInFlight=false;cancel.disabled=false;}
+      candidateError(candidateId,`关联结果需核对：${error instanceof Error?error.message:String(error)}；当前对话未切换。${error instanceof BridgeError&&error.status===409?'请核对已有对话和原关联；本窗口已阻止重复确认，可取消或改选。':''}`,error);
     }finally{if(attempted)this.activeBindingKeys.delete(bindingKey);}
    };
     mountStudioPicker(root,overlay);overlay.querySelector<HTMLElement>('[role="dialog"]')?.focus({preventScroll:true});
     const listed=await client.listCandidates(connection.id);
     sessions=listed.data;
-    if(!isCurrent()){this.invalidateAssociationFor(root);return;}
+    if(!isCurrent()){closePicker();return;}
     const notice=overlay.querySelector<HTMLElement>('[data-studio-read-warning]')!;
     if(connection.kind==='studio'&&validatedStudioReadWarning(listed.readWarning)){notice.textContent=STUDIO_PARTIAL_READ_NOTICE;notice.hidden=false;}
     search.disabled=false;draw();search.focus({preventScroll:true});
-  }catch(error){if(isCurrent()){this.invalidateAssociationFor(root);this.setStatus(root,`读取候选对话失败：${error instanceof Error?error.message:String(error)}`);}}
+  }catch(error){const showUi=isCurrent();closePicker();if(showUi&&sceneCurrent())this.setStatus(root,`读取候选对话失败：${error instanceof Error?error.message:String(error)}`);}
  }
  private actualConnection(){
   const thread=this.threads.find(t=>t.id===this.activeThreadId);
@@ -369,8 +466,10 @@ export default class SiyuanAICollab extends Plugin {
   let version=++this.historyVersion;
   const current=()=>!this.disposed&&!this.chatBusy()&&!this.pendingProposal&&!this.workController.isTransitioning&&connection===this.connectionIdentity()&&selected===this.selectedConnectionId&&confirmed===this.confirmedConnectionId&&chatId===this.activeThreadId&&workId===this.workController.currentWorkId&&documentId===this.currentDocumentId()&&generation===this.workLoadSeq&&navigation===this.workController.navigationVersion&&version===this.historyVersion;
   try{
-   const views=validatedConnections((await createBridgeClient({bridgeUrl:this.bridgeUrl,capabilityToken:this.bridgeToken,signal:AbortSignal.timeout(10000)},'').listConnections()).data);
+   const reply=await createBridgeClient({bridgeUrl:this.bridgeUrl,capabilityToken:this.bridgeToken,signal:AbortSignal.timeout(10000)},'').listConnections();
+   const views=validatedConnections(reply.data);
    if(!current())return false;
+   this.companionEvidence={url:this.bridgeUrl,token:this.bridgeToken,metadata:parseCompanionMetadata(reply.meta)};
    this.connectionViews=views;
    const thread=this.threads.find(t=>t.id===chatId);
    if(thread?.state==='ready'&&thread.adapter!=='unresolved'){
@@ -395,7 +494,7 @@ export default class SiyuanAICollab extends Plugin {
    const pendingItems=await this.workStore.listPending();
    if(!current())return false;
    const pending=pendingItems.some(item=>item.id===`chat-run:${thread.id}`);
-   const messages=bridgeMessagesToChat(data.data).map((m,i)=>({id:`hermes-${thread.id}-${i}`,role:m.role,content:m.content,references:[],status:'complete' as const}));
+   const messages=bridgeMessagesToChat(data.data).map((m,i)=>({id:m.id?`hermes-${thread.id}:remote:${m.id}`:`hermes-${thread.id}:index:${i}`,...(m.id?{remoteMessageId:m.id}:{}),role:m.role,content:m.content,references:[],status:'complete' as const}));
    this.chatReadStatus={chatId:thread.id,connection,ready:true};
    this.threads=this.threads.map(x=>x.id===thread.id?{...x,messages:pending?[...messages,...x.messages.filter(old=>!messages.some(remote=>remote.role===old.role&&remote.content===old.content))]:messages}:x);this.rememberThreads();
    return true;
@@ -438,13 +537,20 @@ export default class SiyuanAICollab extends Plugin {
   root.innerHTML=createChatShell();this.workController.attach(root);
   const shell=root.querySelector<HTMLElement>('.sac')!;
   this.mountQuickPicker(root,shell);
-  const view:EkkoRoomUI=new EkkoRoomUI(shell,{openConnectionSettings:()=>this.openSettings(root,'ekko'),drafts:this.roomDrafts,onChanged:()=>this.refreshSessionViews(),client:()=>new EkkoBridgeClient({bridgeUrl:this.bridgeUrl,capabilityToken:this.bridgeToken}),store:this.roomStore,pendingStore:this.pendingRoomSendStore,
+  this.mountDocumentPanel(root,shell);
+  this.activityPanels.set(root,new ReplyActivityPanel(shell,{rows:()=>this.replyActivities.list(this.connectionIdentity()),open:row=>this.openReplyActivity(root,row),acknowledge:row=>{this.replyActivities.acknowledge(row.key,row.revision);this.renderReplyActivities();}}));
+  this.mountKnowledgePanel(root,shell);this.mountTaskDraftPanel(root);
+  const reviewAdoption=root.ownerDocument.createElement('button');reviewAdoption.type='button';reviewAdoption.dataset.action='review-adoption';reviewAdoption.textContent='核对文档采纳';reviewAdoption.onclick=()=>{try{this.showAnswerAdoption(root);}catch(error){this.setStatus(root,error instanceof Error?error.message:'采纳记录暂不可读取');}};shell.querySelector('.sac-activity-tray')!.append(reviewAdoption);
+  this.replySyncPanels.set(root,new ReplySyncPanel(shell.querySelector<HTMLElement>('.sac-activity-tray')!,{controller:this.replySync,openTarget:async link=>{await this.openReplyActivity(root,{key:'checked-history',revision:0,target:{connection:this.connectionIdentity(),link},state:'unread',acknowledged:false});}}));
+  const view:EkkoRoomUI=new EkkoRoomUI(shell,{onAnswerAction:(action,source,current)=>this.openRoomAnswerWorkflow(root,action,source,current),openConnectionSettings:()=>this.openSettings(root,'ekko'),drafts:this.roomDrafts,onChanged:()=>this.refreshSessionViews(),client:()=>new EkkoBridgeClient({bridgeUrl:this.bridgeUrl,capabilityToken:this.bridgeToken}),store:this.roomStore,pendingStore:this.pendingRoomSendStore,
    isCurrent:()=>!this.disposed&&!this.settingsSaving&&root.isConnected&&this.roomViews.get(root)===view,getSceneIdentity:()=>JSON.stringify([this.connectionIdentity(),this.roomConnectionVersion,this.workController.navigationVersion,this.workLoadSeq]),getBridgeIdentity:()=>JSON.stringify([this.connectionIdentity(),this.roomConnectionVersion]),getWorkId:()=>this.workController.currentWorkId,getDocumentRootId:()=>this.currentDocumentId(),
    availableSources:id=>this.roomAvailableSources(id),loadSource:source=>this.roomLoadSource(source)});
   this.roomViews.set(root,view);
   const events=new (root.ownerDocument.defaultView as any).AbortController() as AbortController;this.bind(root,events.signal);root.querySelector<HTMLButtonElement>('[data-action="retry-connection"]')!.onclick=()=>void this.retryStatus(root);const resizeCleanup=bindComposerResize(root);const menuCleanup=bindDismissibleMenu(root.querySelector('.sac-chat-menu-anchor'),root.querySelector('[data-chat-menu]'),root.querySelector('[data-action="chat-actions-menu"]'),()=>this.setChatMenuOpen(root,false));this.viewCleanup.set(root,()=>{events.abort();resizeCleanup();menuCleanup();const area=root.querySelector<HTMLElement>('[data-messages]');if(area)this.messageRenderers.get(area)?.dispose();for(const el of root.querySelectorAll<HTMLElement>('*')){el.onclick=null;el.onchange=null;}});this.renderConnection(root);this.ensureThread();this.renderThreads(root);this.renderMessages(root);this.renderReferences(root);this.activateDraft();this.renderStatus(root);applyGeneratingState(root,this.chatBusy());void this.workController.refreshFromEditor();if(this.bridgeToken&&!this.connectionOk)void this.refreshConnection();
  }
  private bind(root:HTMLElement,signal?:AbortSignal){this.bindChatActions(root);
+  root.addEventListener('click',event=>{const button=(event.target as Element).closest<HTMLButtonElement>('[data-message-action]');if(button&&root.querySelector('[data-messages]')?.contains(button))void this.openAnswerWorkflow(root,button).catch(error=>this.setStatus(root,error instanceof Error?error.message:'回答操作未能打开'));},{signal});
+  root.querySelector<HTMLButtonElement>('[data-action="selection-task-draft"]')!.onclick=()=>void this.openSelectionTaskDraft(root).catch(error=>this.setStatus(root,error instanceof Error?error.message:'选区暂不可读取'));
   root.querySelector<HTMLButtonElement>('[data-action="reconnect-hermes"]')!.onclick=async()=>{const button=root.querySelector<HTMLButtonElement>('[data-action="reconnect-hermes"]')!;if(!this.isHermesSurface(root)||button.disabled)return;button.disabled=true;try{await this.refreshConnection();}finally{if(this.roomViews.has(root))button.disabled=false;}};
   root.querySelector<HTMLButtonElement>('[data-action="review-send"]')!.onclick=()=>void this.reviewSend(root);
   root.querySelector<HTMLButtonElement>('[data-action="confirm-send-reviewed"]')!.onclick=()=>{if(!this.isHermesSurface(root))return;this.setStatus(root,'人工核对不会解除共享服务未决请求；请继续核对原会话与 Bridge 执行状态。');};
@@ -454,7 +560,42 @@ export default class SiyuanAICollab extends Plugin {
   private updateMentionPicker(root:HTMLElement){const textarea=root.querySelector<HTMLTextAreaElement>('textarea')!;const match=mentionQueryAtCursor(textarea.value,textarea.selectionStart);const refs=match?filterMentionCandidates(this.references.list(),match.query):[];if(match){this.mentionOpen=true;this.mentionIndex=clampMentionIndex(this.mentionIndex,refs.length);this.renderMentionPicker(root,refs);}else this.closeMentionPicker(root);}
   private renderMentionPicker(root:HTMLElement,refs:ReturnType<ReferenceBasket['list']>){const list=root.querySelector<HTMLElement>('[data-mention-list]')!;list.toggleAttribute('hidden',!this.mentionOpen);if(!this.mentionOpen)return;this.mentionIndex=clampMentionIndex(this.mentionIndex,refs.length);list.innerHTML=renderMentionPickerMarkup(refs,this.mentionIndex,this.mentionNumbers());list.querySelectorAll<HTMLButtonElement>('.sac-mention-option').forEach(option=>{option.addEventListener('pointerdown',event=>{event.preventDefault();const textarea=root.querySelector<HTMLTextAreaElement>('textarea')!;const ref=this.references.list().find(r=>r.id===option.dataset.referenceId);if(!ref)return;const result=applyMentionSelection(textarea.value,textarea.selectionStart,ref,this.references.numberOf(ref.id));textarea.value=result.text;textarea.setSelectionRange(result.cursor,result.cursor);textarea.dispatchEvent(new Event('input',{bubbles:true}));this.closeMentionPicker(root);});});}
   private closeMentionPicker(root:HTMLElement){this.mentionOpen=false;const list=root.querySelector<HTMLElement>('[data-mention-list]');if(list)list.toggleAttribute('hidden',true);}
- private showAssociatedChatAction(root:HTMLElement,chatId:string,workId:string|null,message:string){this.setStatus(root,message);const button=root.querySelector<HTMLButtonElement>('[data-action="open-associated-chat"]');if(button){button.dataset.chatId=chatId;button.dataset.workId=workId||'';button.hidden=false;}}
+ private showAssociatedChatAction(root:HTMLElement,chatId:string,workId:string|null,message:string){this.setStatus(root,message);const button=root.querySelector<HTMLButtonElement>('[data-action="open-associated-chat"]');if(button){button.dataset.chatId=chatId;button.dataset.workId=workId||'';button.hidden=false;button.onclick=()=>this.openAssociatedChat(root);}}
+ private async openReadyAssociatedChat(root:HTMLElement,expected:ChatLink,sceneCurrent:()=>boolean):Promise<void>{
+  if(!sceneCurrent())return;
+  const busy=()=>this.chatBusy()||this.pendingProposal||this.workController.isTransitioning;
+  if(busy()){this.setStatus(root,'请先处理当前生成、导航或修改建议');return;}
+  const button=root.querySelector<HTMLButtonElement>('[data-action="open-associated-chat"]'),action=button?.onclick,bridge=this.connectionIdentity(),view=this.viewCleanup.get(root);
+  let navigation=this.workController.navigationVersion,generation=this.workLoadSeq,documentId=this.currentDocumentId(),workId=this.workController.currentWorkId,activeChat=this.activeThreadId,history=this.historyVersion;
+  const sameView=()=>!this.disposed&&root.isConnected&&this.viewCleanup.get(root)===view&&this.connectionIdentity()===bridge&&button?.onclick===action;
+  const current=()=>sameView()&&this.workController.navigationVersion===navigation&&this.workLoadSeq===generation&&this.currentDocumentId()===documentId&&this.workController.currentWorkId===workId&&this.activeThreadId===activeChat&&this.historyVersion===history;
+  const readOriginal=async()=>{
+   const link=await this.workStore.chatLink(expected.chatId);
+   if(!current()||busy())return null;
+   if(!link||link.state!=='ready'||(['chatId','workId','documentRootId','connectionId','adapter','profile','installId','storedSessionId','legacyBridgeUrl'] as const).some(key=>link[key]!==expected[key]))throw new Error('原 Chat 正式关系已变化或结果待确认，请重新核对');
+   return link;
+  };
+  try{
+   let link=await readOriginal();if(!link)return;
+   if(expected.workId&&expected.workId!==workId){
+    const entering=this.workController.enterWork(expected.workId);navigation=this.workController.navigationVersion;await entering;
+    if(!sameView()||this.workController.navigationVersion!==navigation||this.workController.currentWorkId!==expected.workId||this.currentDocumentId()!==expected.documentRootId||busy())return;
+    // Only this guarded Work navigation may replace the Chat/history snapshot before rereading.
+    generation=this.workLoadSeq;documentId=this.currentDocumentId();workId=this.workController.currentWorkId;activeChat=this.activeThreadId;history=this.historyVersion;
+    link=await readOriginal();if(!link)return;
+   }
+   if(!this.chatScopeCurrent(link.workId,link.documentRootId))throw new Error('当前文档或 Work 已变化，请重新核对原 Chat');
+   const existing=this.threads.find(thread=>thread.id===link.chatId);
+   if(existing){if(existing.documentRootId!==link.documentRootId||existing.connectionId!==link.connectionId||existing.profile!==link.profile||(existing.installId||null)!==link.installId||(existing.storedSessionId||null)!==link.storedSessionId||existing.legacyBridgeUrl!==link.legacyBridgeUrl||existing.adapter!==link.adapter||existing.state!=='ready')throw new Error('原 Chat 本地身份已变化，请重新核对');}
+   else this.threads.push(this.threadFromLink(link));
+   await this.selectChat(root,link.chatId,link.connectionId);
+  }catch(error){if(current()&&!busy())this.setStatus(root,error instanceof Error?error.message:String(error));}
+ }
+ private async openAssociatedChat(root:HTMLElement):Promise<void>{
+  const button=root.querySelector<HTMLButtonElement>('[data-action="open-associated-chat"]')!;
+  try{if(button.dataset.workId&&button.dataset.workId!==this.workController.currentWorkId)await this.workController.enterWork(button.dataset.workId);
+  if(button.dataset.chatId)await this.selectChat(root,button.dataset.chatId,button.dataset.connectionId);}catch(error){this.setStatus(root,error instanceof Error?error.message:String(error));}
+ }
  private setStatus(root:HTMLElement,text:string,retry?:()=>Promise<void>){
   if(this.disposed||![...this.roomViews.keys()].some(view=>view===root||view.contains(root)))return;
   if(text==='Hermes · 已连接'){this.updateConnectionUI(true);return;}
@@ -464,7 +605,7 @@ export default class SiyuanAICollab extends Plugin {
   this.renderStatus(root);
  }
  private renderPendingChatNotice(root:HTMLElement,text:string){const el=root.querySelector<HTMLElement>('[data-pending-chats]');if(el){el.textContent=text;el.toggleAttribute('hidden',!text);}const alert=root.querySelector<HTMLElement>('[data-status-alert]');if(alert)alert.toggleAttribute('hidden',!text&&!root.querySelector<HTMLElement>('[data-status]')?.textContent);}
- private renderConnection(root:HTMLElement){const inChat=this.isHermesSurface(root),connected=this.connectionOk&&this.currentConnectionReady();const badge=root.querySelector<HTMLElement>('[data-connection]');badge?.toggleAttribute('hidden',!inChat);const label=root.querySelector<HTMLElement>('[data-connection-label]');if(badge)badge.dataset.state=connected?'connected':(this.connectionText.includes('未连接')?'error':'disconnected');if(badge){const actual=this.actualConnection();badge.title=actual?`${connectionLabel(actual)}：${connectionAdvice(actual)}${!connected?'；原 Chat 未连接，请重连核对':''}`:this.connectionText;}if(label)label.textContent=connected?'已连接':!this.bridgeToken?'未配置':this.connectionText.includes('Studio 授权未通过')?'授权待更新':'未连接';const retry=root.querySelector<HTMLButtonElement>('[data-action="reconnect-hermes"]');if(retry)retry.hidden=!inChat||!this.bridgeToken||connected;}
+ private renderConnection(root:HTMLElement){this.renderReplyActivities();const inChat=this.isHermesSurface(root),connected=this.connectionOk&&this.currentConnectionReady();const badge=root.querySelector<HTMLElement>('[data-connection]');badge?.toggleAttribute('hidden',!inChat);const label=root.querySelector<HTMLElement>('[data-connection-label]');if(badge)badge.dataset.state=connected?'connected':(this.connectionText.includes('未连接')?'error':'disconnected');if(badge){const actual=this.actualConnection();badge.title=actual?`${connectionLabel(actual)}：${connectionAdvice(actual)}${!connected?'；原 Chat 未连接，请重连核对':''}`:this.connectionText;}if(label)label.textContent=connected?'已连接':!this.bridgeToken?'未配置':this.connectionText.includes('Studio 授权未通过')?'授权待更新':'未连接';const retry=root.querySelector<HTMLButtonElement>('[data-action="reconnect-hermes"]');if(retry)retry.hidden=!inChat||!this.bridgeToken||connected;}
  private updateConnectionUI(syncOk:boolean,error?:unknown){if(this.disposed)return;const text=connectionStatus({hasToken:Boolean(this.bridgeToken),syncOk,error});this.connectionText=text;this.connectionOk=syncOk;if(!syncOk){const actual=this.actualConnection();if(actual?.state==='ready')this.connectionViews=this.connectionViews.map(v=>v.id===actual.id?{...v,state:'offline'}:v);}this.roomViews.forEach((_view,root)=>{this.renderConnection(root);this.renderStatus(root);if(syncOk){this.ensureThread();this.renderThreads(root);this.renderMessages(root);}});}
  private refreshConnection(){if(!this.bridgeToken){this.updateConnectionUI(false);return Promise.resolve();}return this.reconnectController?.refreshNow()??Promise.resolve();}
  private renderThreads(root:HTMLElement){
@@ -488,7 +629,7 @@ export default class SiyuanAICollab extends Plugin {
   };
   draw([]);if(isValidDocumentRootId(documentId))void (workId?this.roomStore.listForWork(workId):this.roomStore.listForDocument(documentId)).then(draw).catch(error=>{if(this.sessionVersions.get(root)===version&&this.currentDocumentId()===documentId&&this.roomViews.get(root)===view)this.setStatus(root,`房间关联读取失败：${error.message}`);});
  }
-  private renderMessages(root:HTMLElement){const area=root.querySelector<HTMLElement>('[data-messages]')!;const thread=this.ensureThread();const failed=this.historyFailure;const historyUnavailable=thread?.hermesSessionId&&failed?.workId===this.workController.currentWorkId&&failed?.connection===this.connectionIdentity()&&failed?.chatId===thread.id&&failed?.documentRootId===thread.documentRootId;let renderer=this.messageRenderers.get(area);if(!renderer){renderer=new MessageRenderer<any>(area,renderMessageMarkup);this.messageRenderers.set(area,renderer);}renderer.render(JSON.stringify([this.workController.currentWorkId,this.draftIdentity(),thread?.id]),thread?.messages||[],historyUnavailable?'<div class="sac-empty"><h2>历史暂不可读取</h2><p>已保留原对话的关联。恢复 Hermes 连接后重试，无需新建对话。</p></div>':renderEmptyStateMarkup());this.renderProposal(root);}
+  private renderMessages(root:HTMLElement){const area=root.querySelector<HTMLElement>('[data-messages]')!;const thread=this.ensureThread();const failed=this.historyFailure;const historyUnavailable=thread?.hermesSessionId&&failed?.workId===this.workController.currentWorkId&&failed?.connection===this.connectionIdentity()&&failed?.chatId===thread.id&&failed?.documentRootId===thread.documentRootId;let renderer=this.messageRenderers.get(area);if(!renderer){renderer=new MessageRenderer<any>(area,(message,doc)=>renderMessageMarkup({...message,workflowActions:true},doc));this.messageRenderers.set(area,renderer);}renderer.render(JSON.stringify([this.workController.currentWorkId,this.draftIdentity(),thread?.id]),thread?.messages||[],historyUnavailable?'<div class="sac-empty"><h2>历史暂不可读取</h2><p>已保留原对话的关联。恢复 Hermes 连接后重试，无需新建对话。</p></div>':renderEmptyStateMarkup());this.renderProposal(root);}
  private renderProposal(root:HTMLElement){
   let panel=root.querySelector<HTMLElement>('[data-proposal]');
   if(!panel){panel=document.createElement('section');panel.dataset.proposal='';panel.dataset.chatOnly='';panel.className='sac-proposal';root.querySelector('[data-messages]')?.after(panel);}
@@ -497,8 +638,9 @@ export default class SiyuanAICollab extends Plugin {
   panel.hidden=false;
   panel.innerHTML=`<strong>修改建议 · ${proposal.items.length} 块</strong><small>目标文档 ${escapeHtml(proposal.targetDocumentId)}；接受前会核对文档根与原文。</small>${proposal.items.map(item=>`<details><summary>块 ${escapeHtml(item.blockId)}</summary><div>原文</div><pre>${escapeHtml(item.expectedOriginal)}</pre><div>建议</div><pre>${escapeHtml(item.replacement)}</pre></details>`).join('')}<div><button type="button" data-accept-proposal>接受并写入</button><button type="button" data-reject-proposal>放弃建议</button></div>`;
   panel.querySelector<HTMLButtonElement>('[data-accept-proposal]')!.onclick=()=>void this.accept(root);
-  panel.querySelector<HTMLButtonElement>('[data-accept-proposal]')!.disabled=this.proposalNeedsReview;
-  panel.querySelector<HTMLButtonElement>('[data-reject-proposal]')!.onclick=()=>{this.pendingProposal=null;this.proposalNeedsReview=false;this.renderProposal(root);this.setStatus(root,'已关闭修改建议；如曾尝试写入，请按未决提示核对正文');};
+  panel.querySelector<HTMLButtonElement>('[data-accept-proposal]')!.disabled=this.proposalNeedsReview||this.accepting;
+  panel.querySelector<HTMLButtonElement>('[data-reject-proposal]')!.disabled=this.accepting;
+  panel.querySelector<HTMLButtonElement>('[data-reject-proposal]')!.onclick=()=>{if(this.accepting)return;this.pendingProposal=null;this.proposalNeedsReview=false;for(const view of this.roomViews.keys())this.renderProposal(view);this.setStatus(root,'已关闭修改建议；如曾尝试写入，请按未决提示核对正文');};
  }
  private renderReferences(root:HTMLElement){const area=root.querySelector<HTMLElement>('[data-references]')!;const refs=this.references.list();this.workController.updateReferenceSummary?.(refs.length);area.toggleAttribute('hidden',refs.length===0);area.innerHTML=renderReferenceBasketMarkup(refs);area.querySelectorAll<HTMLButtonElement>('[data-remove-reference]').forEach(button=>button.onclick=()=>{this.references.remove(button.dataset.removeReference!);for(const viewRoot of this.roomViews.keys())this.renderReferences(viewRoot);});}
  private async addCurrentReference(root:HTMLElement){const basket=this.references;const documentRootId=this.currentDocumentId();if(!isValidDocumentRootId(documentRootId)){this.setStatus(root,'请先打开一个思源文档');return;}const editor=this.currentEditor();const input=extractEditorContext({document,activeProtyle:editor?.protyle?.element||null,rootID:documentRootId});if(!input.focusBlockId||!input.selection){this.setStatus(root,'请先选择要引用的文字');return;}try{const k=parseKramdownResponse(await this.api('/api/block/getBlockKramdown',{id:input.focusBlockId}));if(this.disposed)return;basket.add({id:`quote-${++this.quoteSeq}`,blockId:input.focusBlockId,documentRootId:input.documentId,documentTitle:input.title,selectedText:input.selection,startOffset:null,endOffset:null,capturedBlockKramdown:k,expectedOriginal:k,createdAt:new Date().toISOString()});if(this.references===basket){for(const viewRoot of this.roomViews.keys())this.renderReferences(viewRoot);this.setStatus(root,'');}}catch(e:any){this.setStatus(root,`加入引用失败：${e.message}`);}}
@@ -536,7 +678,7 @@ export default class SiyuanAICollab extends Plugin {
   const contextText=buildContextPayload(items,120000-refLength);
   return {...base,contextText:contextText||'本次未附加文档正文'};
  }
- private setGenerating(root:HTMLElement,generating:boolean){applyGeneratingState(root,generating);}
+ private setGenerating(root:HTMLElement,generating:boolean){for(const panel of this.roomViews.keys())applyGeneratingState(panel,generating);if(!this.roomViews.has(root)&&root.isConnected)applyGeneratingState(root,generating);}
  private async stopCurrentRun(root:HTMLElement){
   if(!this.isHermesSurface(root))return;
   if(this.activeRunPhase==='preparing'){this.preSubmitCancelled=true;this.setStatus(root,'发送前已取消；草稿已保留，未请求 Hermes 停止');return;}
@@ -547,7 +689,7 @@ export default class SiyuanAICollab extends Plugin {
   try{
    const bridge=this.activeRunBridge;
    if(!bridge||bridge.chatId!==chatId||bridge.documentRootId!==thread.documentRootId)throw new Error('本轮连接身份不可确认');
-   const result=await createBridgeClient({bridgeUrl:bridge.bridgeUrl,capabilityToken:bridge.capabilityToken},bridge.documentRootId).stopChat(chatId);
+   const result=await createBridgeClient({bridgeUrl:bridge.bridgeUrl,capabilityToken:bridge.capabilityToken},bridge.documentRootId).stopChat(chatId,bridge.runId);
    this.setStatus(root,result.state==='interrupted'?'Hermes 已确认本轮中断':result.state==='not_running'?'Bridge 未持有本轮活跃票据；请到 Hermes 核对':'无法确认仍是本轮，请到 Hermes 核对；未自动中断');
   }catch(error){this.setStatus(root,`停止结果未知，请到 Hermes 核对：${error instanceof Error?error.message:String(error)}`);}
  }
@@ -563,6 +705,8 @@ export default class SiyuanAICollab extends Plugin {
   const frozenThread={...t};
   const frozenBridgeUrl=this.bridgeUrl,frozenBridgeToken=this.bridgeToken;
   const legacyRoute=Boolean(frozenThread.legacyBridgeUrl||/^https?:\/\//.test(frozenThread.connectionId||''));
+  const sendDocument=documentRootId,sendView=this.viewCleanup.get(root),sendScene=this.workLoadSeq;
+  const sendCurrent=()=>!this.disposed&&root.isConnected&&this.viewCleanup.get(root)===sendView&&this.currentDocumentId()===sendDocument&&this.workLoadSeq===sendScene&&this.activeThreadId===frozenThread.id&&this.bridgeUrl===frozenBridgeUrl&&this.bridgeToken===frozenBridgeToken;
   this.sendInFlight=true;
   this.activeRunPhase='preparing';this.preSubmitCancelled=false;
   try{
@@ -592,13 +736,18 @@ export default class SiyuanAICollab extends Plugin {
   const client=createBridgeClient({bridgeUrl:frozenBridgeUrl,capabilityToken:frozenBridgeToken},request.chatRootId);
   this.abortController=new AbortController();this.setGenerating(root,true);
   this.activeRunChatId=t.id;
-  this.activeRunBridge={chatId:t.id,documentRootId:request.chatRootId,bridgeUrl:frozenBridgeUrl,capabilityToken:frozenBridgeToken};
+  const activeRun:{chatId:string;documentRootId:string;bridgeUrl:string;capabilityToken:string;runId?:string}={chatId:t.id,documentRootId:request.chatRootId,bridgeUrl:frozenBridgeUrl,capabilityToken:frozenBridgeToken};
+  this.activeRunBridge=activeRun;
+  const intent={id:`chat-run:${t.id}`,kind:'chat' as const,workId,state:'unknown' as const,details:`Chat ${t.id} 发送意图已记录，结果待确认；attemptId=${crypto.randomUUID()}`,updatedAt:new Date().toISOString()};
   const assistantId=`stream-${Date.now()}`;
   let streamed='',accepted=false,blockerDurable=false;
-  const accept=()=>{if(accepted)return;accepted=true;if(this.workController.currentWorkId===workId&&this.activeThreadId===t.id&&root.isConnected&&textarea.value.trim()===text)prepareOutgoingMessage(textarea);this.threads=this.threads.map(item=>item.id===t.id?appendUserTurn(item,text,refs,{documentId:snapshot.documentId,focusBlockId:snapshot.focusBlockId,nearby:snapshot.nearby}):item);if(this.activeThreadId===t.id&&root.isConnected)this.renderMessages(root);};
+  const activityConnection=this.connectionIdentity(),activityKey=JSON.stringify([activityConnection,t.id]);let activityRevision:number|undefined;
+  const finishActivity=(state:'unread'|'review')=>{if(activityRevision!==undefined&&!this.disposed){this.replyActivities.update(activityKey,activityRevision,state,assistantId);this.renderReplyActivities();}};
+  const renderObservedMessages=()=>{if(!this.disposed&&this.activeThreadId===t.id&&this.workController.currentWorkId===workId&&this.connectionIdentity()===activityConnection)for(const panel of this.roomViews.keys())if(panel.isConnected)this.renderMessages(panel);};
+  const accept=()=>{if(accepted)return;accepted=true;if(this.workController.currentWorkId===workId&&this.activeThreadId===t.id&&root.isConnected&&textarea.value.trim()===text)prepareOutgoingMessage(textarea);this.threads=this.threads.map(item=>item.id===t.id?appendUserTurn(item,text,refs,{documentId:snapshot.documentId,focusBlockId:snapshot.focusBlockId,nearby:snapshot.nearby}):item);renderObservedMessages();};
   const update=(content:string,status?:'complete'|'cancelled'|'error')=>{
    streamed=content;this.threads=this.threads.map(x=>x.id===t.id?upsertAssistantTurn(x,assistantId,content,status):x);
-   if(this.activeThreadId===t.id)this.renderMessages(root);
+   renderObservedMessages();
   };
   try{
    if(!frozenBridgeUrl)throw new Error('未配置 Bridge 地址');
@@ -611,17 +760,19 @@ export default class SiyuanAICollab extends Plugin {
    }
    if(this.preSubmitCancelled||this.abortController.signal.aborted)return;
    if(this.bridgeUrl!==frozenBridgeUrl||this.bridgeToken!==frozenBridgeToken)throw new Error('发送前 Bridge 配置已变化；草稿已保留');
-   await this.workStore.setPending({id:`chat-run:${t.id}`,kind:'chat',workId,state:'unknown',details:`Chat ${t.id} 发送意图已记录，结果待确认`,updatedAt:new Date().toISOString()});
+   await this.workStore.setPending(intent,{ifAbsent:true});
    blockerDurable=true;
    if(this.preSubmitCancelled||this.abortController.signal.aborted){
-    try{await this.workStore.clearPending(`chat-run:${t.id}`);blockerDurable=false;this.setStatus(root,'发送前已取消；草稿已保留，未提交');}
+    try{await this.workStore.clearPending(`chat-run:${t.id}`,intent);blockerDurable=false;this.setStatus(root,'发送前已取消；草稿已保留，未提交');}
     catch{this.setStatus(root,'发送前已取消且未提交；未决阻塞记录清除失败，请人工核对，勿重复发送');}
     return;
    }
    if(this.bridgeUrl!==frozenBridgeUrl||this.bridgeToken!==frozenBridgeToken)throw new Error('发送前 Bridge 配置已变化；原未决记录已保留');
    if(this.preSubmitCancelled||this.abortController.signal.aborted)return;
    this.activeRunPhase='submitting';
-   const result=await streamThreadChat(frozenThread,text,snapshot,{bridgeUrl:frozenBridgeUrl,capabilityToken:frozenBridgeToken,documentRootId:request.chatRootId,references:refs},delta=>update(streamed+delta),this.abortController.signal,(event,raw)=>{
+   activityRevision=this.replyActivities.begin(activityKey,{connection:activityConnection,link});this.renderReplyActivities();
+   const result=await streamThreadChat(frozenThread,text,snapshot,{bridgeUrl:frozenBridgeUrl,capabilityToken:frozenBridgeToken,documentRootId:request.chatRootId,references:refs},delta=>update(streamed+delta),this.abortController.signal,(event,raw,runId)=>{
+    if(event==='run.started'&&runId&&this.activeRunBridge===activeRun)activeRun.runId=runId;
     if(event==='run.queued'||(event==='run.started'&&(frozenThread.adapter!=='serve'||typeof (raw as {userRowId?:unknown})?.userRowId==='number'))||(frozenThread.legacyBridgeUrl&&event==='message.delta'))accept();
    });
    if(!accepted&&result.state==='complete'&&frozenThread.legacyBridgeUrl)accept();
@@ -630,7 +781,7 @@ export default class SiyuanAICollab extends Plugin {
     try{const {chat}=await client.chatForChat(t.id);
      if(chat.chatId!==request.chatId||chat.connectionId!==request.connectionId||chat.documentRootId!==request.chatRootId||chat.kind!==link.adapter||chat.profile!==link.profile||chat.installId!==link.installId||(request.storedSessionId!==null&&chat.storedSessionId!==request.storedSessionId))throw new Error('Bridge Chat 身份与冻结关系不符');
      if(result.state==='queued'&&chat.state==='ready')throw new Error('排队回执与 Bridge Chat 状态不符');
-     if(chat.state==='ready'&&chat.storedSessionId){const confirmed=await this.workStore.confirmChatSession(link,chat.storedSessionId);this.threads=this.threads.map(item=>item.id===t.id?this.threadFromLink(confirmed,item):item);}
+     if(chat.state==='ready'&&chat.storedSessionId){const confirmed=await this.workStore.confirmChatSession(link,chat.storedSessionId);if(activityRevision!==undefined)this.replyActivities.confirmTarget(activityKey,activityRevision,confirmed);this.threads=this.threads.map(item=>item.id===t.id?this.threadFromLink(confirmed,item):item);}
      else if(effectiveState==='complete')effectiveState='unknown';
     }catch{await this.workStore.setPending({id:`chat-run:${t.id}`,kind:'chat',workId,state:'unknown',details:`Chat ${t.id} 持久会话同步未确认，须人工核对`,updatedAt:new Date().toISOString()});this.setStatus(root,'发送后 Chat 身份同步未确认，已保留未决记录；请人工核对');return;}
    }
@@ -644,36 +795,83 @@ export default class SiyuanAICollab extends Plugin {
    const proposal=parseProposal(result.text,snapshot.nearby);
    if(proposal){this.pendingProposal={threadId:t.id,chatRootId:request.chatRootId,targetDocumentId:request.targetDocumentId,items:proposal.plan};this.proposalNeedsReview=false;update(proposal.text,'complete');}
    else update(result.text,'complete');
-   this.references.clear();this.workController.clearOnceContext();this.renderReferences(root);this.updateConnectionUI(true);
+   finishActivity(result.text.trim()?'unread':'review');
+   this.references.clear();this.workController.clearOnceContext();for(const panel of this.roomViews.keys())if(panel.isConnected)this.renderReferences(panel);this.updateConnectionUI(true);
   }catch(e:any){
+   if(blockerDurable&&!legacyRoute&&!accepted&&e instanceof BridgeRunRejectedError){
+    try{const retired=await this.workStore.clearPending(intent.id,intent);if(retired!==false){blockerDurable=false;if(activityRevision!==undefined)this.replyActivities.cancel(activityKey,activityRevision);this.renderReplyActivities();}
+     if(sendCurrent())this.setStatus(root,`${e.message}${retired===false?'；原未决记录已变化，请核对，未清除':''}`);
+    }catch{if(sendCurrent())this.setStatus(root,`${e.message}；本次未发送，未决记录清除失败，请核对`);}
+    return;
+   }
+   if(!sendCurrent())return;
    if(blockerDurable){this.setStatus(root,e?.code==='studio_interaction_required'?`需在 Hermes Studio 处理；Chat ID：${t.id}。未决记录已保留。`:`本轮结果或后续状态未确认；Chat ID：${t.id}。原未决记录已保留，请人工核对，勿重复发送。`);return;}
    this.setStatus(root,`发送前检查或未决记录保存失败；草稿已保留，未提交：${e instanceof Error?e.message:String(e)}`);
-  }finally{this.setGenerating(root,false);this.abortController=undefined;this.activeRunChatId='';this.activeRunBridge=undefined;}
+  }finally{finishActivity('review');this.setGenerating(root,false);if(this.activeRunBridge===activeRun){this.abortController=undefined;this.activeRunChatId='';this.activeRunBridge=undefined;}}
   }catch(error){this.setStatus(root,`发送前无法核对 Chat：${error instanceof Error?error.message:String(error)}；草稿已保留`);}
-  finally{this.sendInFlight=false;this.activeRunPhase=null;this.preSubmitCancelled=false;await this.restoreDurableNotice();this.rememberThreads();}
+  finally{this.sendInFlight=false;this.activeRunPhase=null;this.preSubmitCancelled=false;await this.restoreDurableNotice(sendCurrent);this.rememberThreads();}
  }
 
- private async accept(root:HTMLElement){
-  const proposal=this.pendingProposal;if(!proposal)return;
-  const button=root.querySelector<HTMLButtonElement>('[data-accept-proposal]');if(button)button.disabled=true;
-  try{
-   const result=await applyApprovedProposal(proposal,{
-    getRoot:id=>this.workHost.getDocumentRoot(id),
-    getMarkdown:id=>this.readBlockMarkdown(id),
-    updateMarkdown:async(id,markdown)=>{await this.api('/api/block/updateBlock',{id,data:markdown,dataType:'markdown'});},
-   },true);
-   this.pendingProposal=null;this.renderProposal(root);
-   await this.workStore.clearPending(`write:${proposal.threadId}:${proposal.targetDocumentId}`);
-   this.setStatus(root,`已逐块写回 ${result.written} 块，读回校验通过`);
-  }catch(error){
-   const failure=error instanceof WriteFailure?error:null;
-   if(failure?.attempted){
-    this.proposalNeedsReview=true;
-    await this.workStore.setPending({id:`write:${proposal.threadId}:${proposal.targetDocumentId}`,kind:'write',workId:this.workController.currentWorkId,state:failure.attempted>failure.written?'unknown':'partial',details:`${failure.written}/${failure.total} 块已确认写入；${failure.message}`,updatedAt:new Date().toISOString()}).catch(()=>undefined);
-   }
-   this.setStatus(root,failure?.attempted?`已尝试 ${failure.attempted} 块，确认写入 ${failure.written}/${failure.total} 块；结果需人工核对：${failure.message}`:`未写入：${error instanceof Error?error.message:String(error)}`);
-   if(button&&!(failure?.attempted))button.disabled=false;
+ private renderReplyActivities(){for(const panel of this.activityPanels.values())panel.render();}
+ private async openReplyActivity(root:HTMLElement,row:ReplyActivity):Promise<string>{
+  const expected=row.target.link,connection=row.target.connection,view=this.viewCleanup.get(root);
+  const available=()=>!this.disposed&&root.isConnected&&this.viewCleanup.get(root)===view&&this.connectionIdentity()===connection;
+  const idle=()=>!this.chatBusy()&&!this.pendingProposal&&!this.workController.isTransitioning;
+  const check=()=>{if(!available()||!idle())throw Error('当前视图、连接或操作状态已变化，请稍后重新打开原会话');};
+  check();let navigation=this.workController.navigationVersion,activeChat=this.activeThreadId,history=this.historyVersion,generation=this.workLoadSeq,room=this.roomViews.get(root)?.activeLink;
+  const sceneCurrent=()=>navigation===this.workController.navigationVersion&&activeChat===this.activeThreadId&&history===this.historyVersion&&generation===this.workLoadSeq&&room===this.roomViews.get(root)?.activeLink;
+  const ownScene=()=>{activeChat=this.activeThreadId;history=this.historyVersion;generation=this.workLoadSeq;room=this.roomViews.get(root)?.activeLink;};
+  const readOriginal=async()=>{
+   const link=await this.workStore.chatLink(expected.chatId);check();
+   if(!sceneCurrent())throw Error('文档或会话选择已变化，请重新打开原会话');
+   if(!link||!['ready','pending'].includes(link.state)||(['chatId','workId','documentRootId','connectionId','adapter','profile','installId','legacyBridgeUrl'] as const).some(key=>link[key]!==expected[key])||link.storedSessionId!==expected.storedSessionId)throw Error('原会话关系或身份已变化，请核对原关联；回复提示已保留');
+   return link;
+  };
+  let link=await readOriginal();
+  if(!this.chatScopeCurrent(link.workId,link.documentRootId)){
+   const opening=link.workId?this.workController.openWorkDocument(link.workId,link.documentRootId):this.workController.openDocumentFromPage(link.documentRootId,null,available);
+   navigation=this.workController.navigationVersion;await opening;check();
+   if(navigation!==this.workController.navigationVersion||this.currentDocumentId()!==link.documentRootId)throw Error('原文档打开未确认，请重新核对');
+   if(!link.workId){const preparation=this.prepareChatOperation(root,link.documentRootId,undefined,available);navigation=this.workController.navigationVersion;const owner=await preparation.scope;if(!preparation.isCurrent()||owner!==null)throw Error('原文档归属已变化，请核对原会话');}
+   ownScene();link=await readOriginal();
   }
+  if(!this.chatScopeCurrent(link.workId,link.documentRootId))throw Error('原文档或 Work 未确认，请重新核对');
+  const thread=this.threads.find(item=>item.id===link.chatId);
+  if(!thread||thread.connectionId!==link.connectionId||thread.documentRootId!==link.documentRootId||thread.adapter!==link.adapter||thread.profile!==link.profile||(thread.installId||null)!==link.installId||(thread.storedSessionId||null)!==link.storedSessionId||thread.legacyBridgeUrl!==link.legacyBridgeUrl)throw Error('原会话本地身份已变化，请重新核对');
+  this.documentPanels.get(root)?.show('chat');
+  if(this.activeThreadId!==link.chatId){await this.selectChat(root,link.chatId,link.connectionId);check();}
+  else{this.roomViews.get(root)?.leave();this.renderThreads(root);this.renderMessages(root);}
+  if(this.activeThreadId!==link.chatId)throw Error('原会话暂未打开，提示已保留');
+  const area=root.querySelector<HTMLElement>('[data-messages]');
+  if(area&&row.messageId)this.messageRenderers.get(area)?.revealMessage(row.messageId);
+  return '已打开原会话；刷新后的历史请查看最近记录，阅读后可标为已查看。';
+ }
+ private async accept(root:HTMLElement){
+  const source=this.pendingProposal;
+  if(!source||this.proposalNeedsReview||this.chatBusy()||this.workController.isTransitioning)return;
+  const proposal=structuredClone(source),connection=this.connectionIdentity(),navigation=this.workController.navigationVersion,workId=this.workController.currentWorkId,view=this.viewCleanup.get(root);
+  const current=()=>!this.disposed&&root.isConnected&&this.viewCleanup.get(root)===view&&this.pendingProposal===source&&this.activeThreadId===proposal.threadId&&this.connectionIdentity()===connection&&this.workController.navigationVersion===navigation&&this.workController.currentWorkId===workId&&this.currentDocumentId()===proposal.chatRootId;
+  const check=()=>{if(!current())throw Error('原会话、目标文档或视图已变化，请重新核对修改建议');};
+  const render=()=>{if(!this.disposed)for(const panel of this.roomViews.keys())this.renderProposal(panel);};
+  const report=(message:string)=>{if(!this.disposed&&root.isConnected&&this.viewCleanup.get(root)===view)this.setStatus(root,message);};
+  const intent={id:`write:${proposal.threadId}:${proposal.targetDocumentId}`,kind:'write' as const,workId,state:'unknown' as const,details:`修改建议写入意图；目标文档=${proposal.targetDocumentId}，${proposal.items.length} 块；attemptId=${crypto.randomUUID()}。结果未确认时请核对原文，勿重复写入。`,updatedAt:new Date().toISOString()};
+  let fenced=false,attempted=false;
+  this.accepting=true;render();
+  try{
+   check();await this.workStore.setPending(intent,{ifAbsent:true});fenced=true;check();
+   const result=await applyApprovedProposal(proposal,{
+    getRoot:id=>this.workHost.getDocumentRoot(id),getMarkdown:id=>this.readBlockMarkdown(id),beforeWrite:check,
+    updateMarkdown:async(id,markdown)=>{attempted=true;await this.api('/api/block/updateBlock',{id,data:markdown,dataType:'markdown'});},
+   },true);
+   check();if(!await this.workStore.clearPending(intent.id,intent))throw Error('未决记录已变化，不能确认本轮完成，请人工核对');
+   fenced=false;this.pendingProposal=null;report(`已逐块写回 ${result.written} 块，读回校验通过`);
+  }catch(error){
+   let retained=attempted;
+   if(fenced&&!attempted){try{retained=!await this.workStore.clearPending(intent.id,intent);}catch{retained=true;}}
+   if(retained)this.proposalNeedsReview=true;
+   const failure=error instanceof WriteFailure?error:null;
+   report(attempted?`已尝试写入，结果需人工核对${failure?`（${failure.attempted}/${failure.total} 块已尝试）`:''}：${error instanceof Error?error.message:String(error)}；未决记录保留，勿重复写入。`:`未写入：${error instanceof Error?error.message:String(error)}${retained?'；未决记录未能解除，请先核对。':''}`);
+  }finally{this.accepting=false;render();}
  }
  private async openWorkPage(route:WorkPageRoute):Promise<void>{
   const editor=this.currentEditor();
@@ -708,6 +906,18 @@ export default class SiyuanAICollab extends Plugin {
    resume:async id=>{await this.workController.resumeWork(id);this.showChatDock();},
    openDocument:async(id,documentId)=>{await this.workController.openWorkDocument(id,documentId);this.showChatDock();},
    task:async id=>{await this.workController.enterTask(id);},
+   editTask:async(id,taskId,pageCurrent)=>{
+    const navigation=this.workController.navigationVersion,app=this.app;
+    const current=()=>!this.disposed&&pageCurrent()&&this.app===app&&navigation===this.workController.navigationVersion&&!this.chatBusy()&&!this.pendingProposal;
+    if(!current())throw Error('当前页面或会话正忙，请先处理回复或待接受的修改，再核对任务。');
+    const work=await this.workService.readWork(id);
+    if(!current())throw Error('页面或操作状态已变化，请重新核对任务。');
+    if(!work)throw Error('Work 不存在或标记已移除，请刷新核对。');
+    const links=await this.workStore.listTasks(id);
+    if(!current())throw Error('页面或操作状态已变化，请重新核对任务。');
+    if(!links.some(link=>link.workId===id&&link.taskId===taskId&&link.connectionId==='siyuan-native-local'))throw Error('任务与 Work 的正式关联已变化，请刷新核对。');
+    return (await this.nativeTaskEditor.open({taskId,isCurrent:current})).reason;
+   },
    create:async (captured,mode)=>{await this.workCreateForm.open(captured,mode);},
    settings:()=>this.openSettings(element,'hermes'),
    createTask:async(workId,context,current)=>this.openTaskDialog(workId,context,current,'create',()=>page.refresh()),
@@ -719,7 +929,19 @@ export default class SiyuanAICollab extends Plugin {
     const work=await this.workService.readWork(id);
     if(!work)throw Error('Work 不存在或标记损坏');
     if(!canChange()||work.status!==expectedStatus)throw Error('页面或工作状态已变化，请刷新后重新确认');
-    if(!window.confirm(`将“${work.title}”从“${workStatusLabels[expectedStatus]}”改为“${workStatusLabels[status]}”？\n${workStatusDescriptions[status]}\n文档、资料、任务关联与会话记录继续保留，可再次更改状态。`))return false;
+    let taskReminder='';
+    if(status==='completed'||status==='closed'){
+     try{
+      const links=await this.workStore.listTasks(id);
+      const tasks:TaskLookup[]=await Promise.all(links.map(async link=>{
+       if(link.connectionId!=='siyuan-native-local')return {kind:'unavailable' as const,reason:'任务属于其他连接'};
+       try{return await this.taskReader.getTask(link.taskId);}catch(error){return {kind:'unavailable' as const,reason:error instanceof Error?error.message:String(error)};}
+      }));
+      taskReminder='\n'+taskCompletionReminder(tasks);
+     }catch{taskReminder='\n关联任务暂不可读取，请在任务插件核对。Work 状态独立，本次不会更改任务或项目。';}
+     if(!canChange())throw Error('页面或操作状态已变化，请重新确认 Work 状态。');
+    }
+    if(!window.confirm(`将“${work.title}”从“${workStatusLabels[expectedStatus]}”改为“${workStatusLabels[status]}”？\n${workStatusDescriptions[status]}\n文档、资料、任务关联与会话记录继续保留，可再次更改状态。${taskReminder}`))return false;
     await this.workService.setStatus(id,status,true,{expectedStatus,isCurrent:canChange});
     return true;
    },
@@ -763,17 +985,13 @@ export default class SiyuanAICollab extends Plugin {
   if(workId&&!work)throw Error('Work 不存在或标记损坏');
   await this.taskDialog.open({documentId,title,workId,workTitle:work?.title,isCurrent:current,onLinked},mode);
  }
- private disposeRoomView(root:HTMLElement){this.settingsDialog?.dispose();this.quickPickers.get(root)?.dispose();this.quickPickers.delete(root);this.statusRetry.delete(root);this.operationNotices.delete(root);if(this.associationRoot===root)this.closeAssociation();if(this.roomViews.has(root))this.saveDraft(root);this.viewCleanup.get(root)?.();this.viewCleanup.delete(root);this.sessionVersions.set(root,(this.sessionVersions.get(root)||0)+1);this.workController.detachRoot(root);this.roomViews.get(root)?.dispose();this.roomViews.delete(root);}
- private chatBusy(){return this.settingsSaving||this.sendInFlight||this.preparing||Boolean(this.abortController)||this.accepting;}
+ private disposeRoomView(root:HTMLElement){this.adoptionPanels.get(root)?.dispose();this.adoptionPanels.delete(root);this.adoptionSources.delete(root);this.taskDraftPanels.get(root)?.dispose();this.taskDraftPanels.delete(root);this.workflowSourceGuards.delete(root);this.knowledgePanels.get(root)?.dispose();this.knowledgePanels.delete(root);this.replySyncPanels.get(root)?.dispose();this.replySyncPanels.delete(root);this.activityPanels.get(root)?.dispose();this.activityPanels.delete(root);this.settingsDialog?.dispose();this.documentPanels.get(root)?.dispose();this.documentPanels.delete(root);this.quickPickers.get(root)?.dispose();this.quickPickers.delete(root);this.statusRetry.delete(root);this.operationNotices.delete(root);if(this.associationRoot===root)this.closeAssociation();if(this.roomViews.has(root))this.saveDraft(root);this.viewCleanup.get(root)?.();this.viewCleanup.delete(root);this.sessionVersions.set(root,(this.sessionVersions.get(root)||0)+1);this.workController.detachRoot(root);this.roomViews.get(root)?.dispose();this.roomViews.delete(root);}
+ private chatBusy(){return this.settingsSaving||this.sendInFlight||this.preparing||Boolean(this.abortController)||this.accepting||Boolean(this.answerAdoption?.isBusy);}
  private bindChatActions(root:HTMLElement):void{
   root.querySelector<HTMLButtonElement>('[data-action="chat-actions-menu"]')!.onclick=()=>this.setChatMenuOpen(root,root.querySelector<HTMLElement>('[data-chat-menu]')!.hidden);
   root.querySelector<HTMLButtonElement>('[data-action="associate-ekko"]')!.onclick=()=>{this.setChatMenuOpen(root,false);void this.associateRoom(undefined,()=>true,root);};
   root.querySelector<HTMLButtonElement>('[data-action="chat-menu-new"]')!.onclick=()=>{this.setChatMenuOpen(root,false);void this.startNewChat(root);};
-  root.querySelector<HTMLButtonElement>('[data-action="open-associated-chat"]')!.onclick=async()=>{
-   const button=root.querySelector<HTMLButtonElement>('[data-action="open-associated-chat"]')!;
-   try{if(button.dataset.workId&&button.dataset.workId!==this.workController.currentWorkId)await this.workController.enterWork(button.dataset.workId);
-   if(button.dataset.chatId)await this.selectChat(root,button.dataset.chatId,button.dataset.connectionId);}catch(error){this.setStatus(root,error instanceof Error?error.message:String(error));}
-  };
+  root.querySelector<HTMLButtonElement>('[data-action="open-associated-chat"]')!.onclick=()=>this.openAssociatedChat(root);
  }
  private closeAssociation(){this.associationGeneration++;this.associationOverlay?.remove();this.associationOverlay=undefined;this.associationRoot=undefined;this.associationOpen=false;document.querySelectorAll<HTMLButtonElement>('.sac [data-action="associate-studio"],.sac [data-action="chat-actions-menu"]').forEach(button=>button.disabled=false);}
  private chatScopeKey(workId=this.workController.currentWorkId,documentId=this.workController.activeDocumentId||this.currentDocumentId()){return workId||JSON.stringify(['document',documentId]);}
@@ -868,6 +1086,114 @@ export default class SiyuanAICollab extends Plugin {
   overlay.querySelector('[data-close-room]')!.addEventListener('click',close);
   await view.enter();
  }
+ private workflowIdle(root:HTMLElement):boolean{return !this.disposed&&root.isConnected&&this.roomViews.has(root)&&!this.chatBusy()&&!this.pendingProposal&&!this.workController.isTransitioning;}
+ private mountTaskDraftPanel(root:HTMLElement):void {
+  this.workflowSourceGuards.set(root,new Map());
+  this.taskDraftPanels.set(root,new TaskDraftPanel(root.ownerDocument,{isCurrent:source=>Boolean(this.workflowSourceGuards.get(root)?.get(source.key)?.()),copyText:async text=>{const clipboard=root.ownerDocument.defaultView?.navigator.clipboard;if(!clipboard?.writeText)throw Error('剪贴板不可用，请手动复制草稿');await clipboard.writeText(text);},openNative:async(source,current)=>{if(!current()||!this.workflowIdle(root))throw Error('文档或操作状态已变化');const prior=this.nativeTaskAdapter.getState();if(prior.kind==='opened'||prior.kind==='unknown')return {kind:'unknown',reason:'原插件中还有此前发起的任务入口；本次未重新打开。请先核对，再明确准备下一次创建。'};const result=await this.nativeTaskAdapter.open({documentId:source.documentId,isCurrent:()=>current()&&this.workflowIdle(root)});return result.target?.documentId===source.documentId?result:{kind:'unknown',reason:'原任务入口的来源与本次草稿不一致，请先到原插件核对。'};},prepareNext:(source,current)=>{if(!current()||!this.workflowIdle(root))return false;if(!window.confirm('请先在原任务插件核对上一次创建结果。此操作不会撤销或证明已创建任务，只允许你明确打开下一次创建。已核对并继续？'))return false;return current()&&this.workflowIdle(root)&&this.nativeTaskAdapter.prepareNext();},associate:async(source,current)=>{if(!current()||!this.workflowIdle(root)||source.documentId!==this.currentDocumentId())throw Error('文档或操作状态已变化');if(this.workController.currentWorkId)await this.openTaskDialog(this.workController.currentWorkId,null,current,'link');else this.documentPanels.get(root)?.show('associations','tasks');}}));
+ }
+ private async openTaskDraft(root:HTMLElement,kind:TaskDraftSource['kind'],body:string,identity:string,current:()=>boolean):Promise<void>{
+  const documentId=this.currentDocumentId(),scene=this.iterationScene(root),key=await adoptionDigest(JSON.stringify(['task-draft-source-v1',scene,identity,body]));
+  const original=()=>this.iterationScene(root)===scene&&this.workflowIdle(root)&&current();if(!original())throw Error('回答或选区来源已变化，请重新整理');
+  const source:TaskDraftSource={kind,key,documentId:documentId||null,documentTitle:readEditorDocumentTitle(this.currentEditor()?.protyle?.element)};
+  const guards=this.workflowSourceGuards.get(root)!;if(guards.size>=100&&!guards.has(key))guards.delete(guards.keys().next().value!);guards.set(key,original);
+  this.taskDraftPanels.get(root)?.open({source,body});
+ }
+ private async openAnswerWorkflow(root:HTMLElement,button:HTMLButtonElement):Promise<void>{
+  if(!this.workflowIdle(root)||!this.isHermesSurface(root))throw Error('请先处理当前生成、导航或修改建议');
+  const thread=this.threads.find(item=>item.id===this.activeThreadId),id=button.closest<HTMLElement>('[data-message-id]')?.dataset.messageId,message=thread?.messages.find(item=>item.id===id);
+  if(!thread||!message||message.role!=='assistant'||message.status!=='complete'||!message.content.trim())throw Error('请先等待完整普通回答');
+  const body=message.content,scene=this.iterationScene(root);
+  const current=()=>this.iterationScene(root)===scene&&this.threads.find(item=>item.id===thread.id)?.messages.some(item=>item.id===id&&item.role==='assistant'&&item.status==='complete'&&item.content===body)===true;
+  if(button.dataset.messageAction==='task-draft')await this.openTaskDraft(root,'answer',body,JSON.stringify([thread.id,id]),current);
+  else if(button.dataset.messageAction==='adopt'){
+   const url=this.bridgeUrl,token=this.bridgeToken,documentId=this.currentDocumentId();if(!isValidDocumentRootId(documentId))throw Error('请先打开要追加的原文档');
+   const namespace=await pairedBridgeNamespace(url,token);if(!current()||!this.workflowIdle(root)||url!==this.bridgeUrl||token!==this.bridgeToken)throw Error('回答来源已变化');
+   const source:AdoptionSource={conversationKey:JSON.stringify(['hermes-answer-v1',namespace,thread.adapter,thread.connectionId,thread.profile,thread.installId||null,thread.storedSessionId||thread.id,thread.legacyBridgeUrl||null]),...(message.remoteMessageId?{messageId:message.remoteMessageId}:{}),role:'assistant',complete:true,content:body,documentId};
+   const sourceCurrent=()=>current()&&!this.disposed&&root.isConnected&&this.roomViews.has(root)&&!this.settingsSaving&&!this.sendInFlight&&!this.preparing&&!this.abortController&&!this.accepting&&!this.pendingProposal&&!this.workController.isTransitioning;
+   this.showAnswerAdoption(root,source,sourceCurrent);
+  }
+ }
+ private async openRoomAnswerWorkflow(root:HTMLElement,action:'adopt'|'task-draft',answer:RoomAnswerSource,isRoomCurrent:()=>boolean):Promise<void>{
+  const scene=this.iterationScene(root),url=this.bridgeUrl,token=this.bridgeToken;
+  const current=()=>this.iterationScene(root)===scene&&isRoomCurrent()&&this.currentDocumentId()===answer.documentId;
+  if(!current()||!this.workflowIdle(root)||this.isHermesSurface(root))throw Error('原回答或房间状态已变化，请重新选择');
+  if(action==='task-draft'){await this.openTaskDraft(root,'answer',answer.content,JSON.stringify(['ekko',answer.link,answer.messageId,answer.senderId]),current);return;}
+  if(!isValidDocumentRootId(answer.documentId))throw Error('请先打开要追加的原文档');
+  const namespace=await pairedBridgeNamespace(url,token);if(!current()||!this.workflowIdle(root)||url!==this.bridgeUrl||token!==this.bridgeToken)throw Error('回答来源已变化');
+  const link=answer.link,source:AdoptionSource={conversationKey:JSON.stringify(['ekko-answer-v1',namespace,link.connectionId,link.deviceId,link.accountUserId,link.roomId]),messageId:answer.messageId,role:'assistant',complete:true,content:answer.content,documentId:answer.documentId};
+  this.showAnswerAdoption(root,source,()=>current()&&!this.disposed&&root.isConnected&&this.roomViews.has(root)&&!this.settingsSaving&&!this.sendInFlight&&!this.preparing&&!this.abortController&&!this.accepting&&!this.pendingProposal&&!this.workController.isTransitioning);
+ }
+ private getAnswerAdoption():AnswerAdoptionController {
+  return this.answerAdoption??=new AnswerAdoptionController({storage:this.workflowStorage,pendingStore:this.workStore.pendingPort(this.workflowStorage),native:new SiYuanAnswerAdoptionNative({api:(path,body)=>this.api(path,body),document,lute:window.Lute}),isCurrent:source=>[...this.adoptionSources.values()].some(value=>value.key===JSON.stringify(source)&&value.current())});
+ }
+ private showAnswerAdoption(root:HTMLElement,source?:AdoptionSource,isCurrent?:()=>boolean):void{
+  if(!this.workflowIdle(root))throw Error('请先处理当前操作，再核对文档采纳');
+  if(this.adoptionPanels.has(root)){root.ownerDocument.querySelector<HTMLElement>('[data-answer-adoption] button')?.focus();return;}
+  const overlay=root.ownerDocument.createElement('div');overlay.className='sac-create-overlay';overlay.dataset.answerAdoption='';
+  if(source&&isCurrent)this.adoptionSources.set(root,{key:JSON.stringify(source),current:isCurrent});
+  root.ownerDocument.body.append(overlay);
+  const panel=new AnswerAdoptionPanel(overlay,{controller:this.getAnswerAdoption(),source,target:source?{documentId:source.documentId,title:readEditorDocumentTitle(this.currentEditor()?.protyle?.element)||'当前文档'}:undefined,listNotebooks:()=>this.workHost.listNotebooks(),copyText:async text=>{const clipboard=root.ownerDocument.defaultView?.navigator.clipboard;if(!clipboard?.writeText)throw Error('剪贴板不可用，请选择原文复制');await clipboard.writeText(text);},isCurrent,onClose:()=>{overlay.remove();if(this.adoptionPanels.get(root)===panel){this.adoptionPanels.delete(root);this.adoptionSources.delete(root);}}});
+  this.adoptionPanels.set(root,panel);overlay.querySelector<HTMLButtonElement>('[data-adoption-action="close"]')?.focus({preventScroll:true});
+ }
+ private async openSelectionTaskDraft(root:HTMLElement):Promise<void>{
+  if(!this.workflowIdle(root))throw Error('请先处理当前操作');
+  const scene=this.iterationScene(root),documentId=this.currentDocumentId(),input=extractEditorContext({document:root.ownerDocument,activeProtyle:this.currentEditor()?.protyle?.element||null,rootID:documentId});
+  if(!isValidDocumentRootId(documentId)||!input.focusBlockId||!input.selection.trim())throw Error('请先在文档中选择要整理的文字');
+  const current=()=>this.iterationScene(root)===scene;
+  const info=await this.api('/api/block/getBlockInfo',{id:input.focusBlockId});if(!current()||info?.rootID!==documentId||info.id!==undefined&&info.id!==input.focusBlockId)throw Error('选区文档来源已变化');
+  const raw=await this.api('/api/block/getBlockKramdown',{id:input.focusBlockId});if(!current()||raw?.id!==input.focusBlockId||typeof raw.kramdown!=='string'||!raw.kramdown.includes(input.selection))throw Error('选区原文已变化，请重新选择');
+  await this.openTaskDraft(root,'selection',input.selection,JSON.stringify([documentId,input.focusBlockId]),current);
+ }
+ private iterationScene(root:HTMLElement):string {return JSON.stringify([this.disposed,root.isConnected,this.currentDocumentId(),this.workController.currentWorkId,this.workController.navigationVersion,this.workLoadSeq,this.activeThreadId,this.connectionIdentity(),this.roomViews.get(root)?.activeLink,root.querySelector<HTMLElement>('.sac')?.dataset.surface]);}
+ private getKnowledgeScope(choice:KnowledgeScopeChoice,signal?:AbortSignal):Promise<KnowledgeScope>{return boundedKnowledgeRead(readSignal=>this.readKnowledgeScope(choice,readSignal),signal);}
+ private async readKnowledgeScope(choice:KnowledgeScopeChoice,signal:AbortSignal):Promise<KnowledgeScope>{
+  signal?.throwIfAborted();if(choice==='all')return freezeKnowledgeScope({kind:'all'});
+  const documentId=this.currentDocumentId(),workId=this.workController.currentWorkId,navigation=this.workController.navigationVersion;
+  const check=()=>{signal?.throwIfAborted();if(this.disposed||documentId!==this.currentDocumentId()||workId!==this.workController.currentWorkId||navigation!==this.workController.navigationVersion)throw Error('当前文档或 Work 已变化，请重新检索');};
+  const host=new SiYuanWorkHost((path,body)=>{check();return this.api(path,body,signal);});const service=new WorkService(host,this.workStore);
+  let ids=[documentId];
+  if(choice==='work'){if(!workId)throw Error('当前没有选定 Work，可检索当前文档');const children=await boundedKnowledgeRead(()=>host.listDescendantDocuments(workId),signal);check();const external=await boundedKnowledgeRead(()=>service.listExternalDocuments(workId),signal);check();ids=[documentId,workId,...children,...external];}
+  const roots=[...new Set(ids.filter(isValidDocumentRootId))];if(!roots.length||roots.length>200)throw Error('请先选择有效且不超过 200 篇的文档范围');
+  const documents:KnowledgeDocument[]=[];
+  for(const rootId of roots){const info=await boundedKnowledgeRead(readSignal=>this.api('/api/block/getBlockInfo',{id:rootId},readSignal),signal);check();if(!info||info.rootID!==rootId||info.id!==undefined&&info.id!==rootId)throw Error('文档来源未核实');const title=await boundedKnowledgeRead(()=>host.getDocumentTitle(rootId),signal);check();documents.push({rootId,box:info.box,path:info.path,title});}
+  return freezeKnowledgeScope({kind:'documents',documents});
+ }
+ private mountKnowledgePanel(root:HTMLElement,shell:HTMLElement):void {
+  const panel=new KnowledgePanel(shell.querySelector<HTMLElement>('[data-knowledge-panel]')!,{api:(path,body,signal)=>this.api(path,body,signal),currentScene:()=>this.iterationScene(root),getScope:(choice,signal)=>this.getKnowledgeScope(choice,signal),addReference:(block,current)=>this.addKnowledgeReference(root,block,current),openDocument:async(_id,blockId,current)=>{if(this.disposed||!root.isConnected||!current()||this.chatBusy()||this.pendingProposal||this.workController.isTransitioning)throw Error('页面或当前操作已变化，请重新打开来源');await openTab({app:this.app,doc:{id:blockId,action:['cb-get-focus']}});}});
+  this.knowledgePanels.set(root,panel);
+ }
+ private async addKnowledgeReference(root:HTMLElement,block:KnowledgeBlock,isCurrent:()=>boolean):Promise<void>{
+  const current=()=>!this.disposed&&root.isConnected&&this.roomViews.has(root)&&isCurrent()&&!this.chatBusy()&&!this.pendingProposal&&!this.workController.isTransitioning;
+  if(!current())throw Error('页面或操作状态已变化，引用未加入');
+  if(!this.isHermesSurface(root)){const view=this.roomViews.get(root)!;await view.addReferenceSource({label:block.title||'检索原文',source:{kind:'selection',documentId:block.rootId,blockId:block.id,selectedText:block.markdown,originalBlock:block.markdown}},current);return;}
+  this.references.add({id:`quote-${++this.quoteSeq}`,blockId:block.id,documentRootId:block.rootId,documentTitle:block.title,selectedText:block.markdown,startOffset:null,endOffset:null,capturedBlockKramdown:block.markdown,expectedOriginal:block.markdown,createdAt:new Date().toISOString()});
+  for(const view of this.roomViews.keys())this.renderReferences(view);
+ }
+ private async replyTargetCurrent(expected:ChatLink):Promise<boolean>{
+  const actual=(await this.workStore.listAllChatsReadOnly(this.workflowStorage)).find(link=>link.chatId===expected.chatId);
+  return !this.disposed&&Boolean(actual)&&(['chatId','workId','documentRootId','connectionId','adapter','profile','installId','storedSessionId','legacyBridgeUrl','state'] as const).every(key=>actual![key]===expected[key]);
+ }
+ private async readReplySnapshot(link:ChatLink,signal:AbortSignal){
+  const url=this.bridgeUrl,token=this.bridgeToken,evidence=this.companionEvidence;
+  if(!evidence||evidence.url!==url||evidence.token!==token||!evidence.metadata?.capabilities.includes(HERMES_HISTORY_SNAPSHOT_CAPABILITY))throw Object.assign(Error('当前配套没有完整历史只读快照能力，请更新配套后检查；原会话仍可正常打开'),{code:'history_snapshot_unsupported'});
+  if(!await this.replyTargetCurrent(link)||url!==this.bridgeUrl||token!==this.bridgeToken)throw Error('原会话关系或连接已变化');
+  const snapshot=await createBridgeClient({bridgeUrl:url,capabilityToken:token},link.documentRootId).historySnapshotForChat(link.chatId,signal);
+  if(!await this.replyTargetCurrent(link)||url!==this.bridgeUrl||token!==this.bridgeToken||signal.aborted)throw Error('原会话关系或连接已变化');
+  return snapshot;
+ }
+ private mountDocumentPanel(root:HTMLElement,shell:HTMLElement):void {
+  const panel=new DocumentAssociationPanel(shell,{
+   currentDocument:()=>{const id=this.currentDocumentId();return id?{id,title:readEditorDocumentTitle(this.currentEditor()?.protyle?.element)}:null;},
+   onViewChanged:view=>{const panel=this.knowledgePanels.get(root),area=shell.querySelector<HTMLElement>('[data-knowledge-panel]');if(area)area.hidden=view!=='knowledge';if(view==='knowledge')panel?.show();else panel?.hide();},
+   documentTitle:id=>this.workHost.getDocumentTitle(id),
+   loadWorks:id=>this.documentAssociations.listWorks(id),linkWork:(id,work,current)=>this.documentAssociations.linkWork(id,work,current),
+   listTaskLinks:id=>this.documentAssociations.listTaskLinks(id),searchTasks:query=>query.trim()?this.taskReader.search(query):this.taskReader.listRecent(5),
+   linkTask:(id,task,current)=>this.documentAssociations.linkTask(id,task,current),unlinkTask:(id,task,current)=>this.documentAssociations.unlinkTask(id,task,current),
+   editTask:async(id,task,current)=>{await this.documentAssociations.checkTaskLink(id,task,current);return (await this.nativeTaskEditor.open({taskId:task,isCurrent:()=>current()&&!this.disposed&&!this.chatBusy()&&!this.pendingProposal&&!this.workController.isTransitioning&&this.currentDocumentId()===id})).reason;},
+   openWork:id=>{void this.openWorkPage({kind:'detail',workId:id});},
+   createWork:async()=>{const id=this.currentDocumentId();await this.workCreateForm.open(id?{documentId:id,title:await this.workHost.getDocumentTitle(id)}:null);},confirm:message=>window.confirm(message),
+  });this.documentPanels.set(root,panel);
+ }
  private mountQuickPicker(root:HTMLElement,shell:HTMLElement):void {
   const picker=new WorkQuickPicker(shell,{
    load:async()=>Promise.all((await this.workStore.listWorks()).map(async id=>{
@@ -923,7 +1249,9 @@ export default class SiyuanAICollab extends Plugin {
   const config={selectedConnectionId:input.connectionId||this.confirmedConnectionId,bridgeUrl:input.url||this.bridgeUrl,capabilityToken:input.token||this.bridgeToken};
   const result=await(input.detect?detectLocalBridge(config,fetch,current):inspectLocalBridge(config,fetch,current));
   if(!current())throw Object.assign(Error('文档、连接偏好或操作状态已变化，请重新检测'),{saveOutcome:'stale'});
-  return {...result,saveOutcome:'not-requested'};
+  const inspection:BridgeInspection={...result,saveOutcome:'not-requested'};
+  this.settingsInspectionScopes.set(inspection,{url:result.url,token:config.capabilityToken,connectionId:this.confirmedConnectionId});
+  return inspection;
  }
  private async connectSettingsBridge(input:BridgeSettingsInput,isCurrent:()=>boolean=()=>true):Promise<BridgeInspection>{
   const pluginCurrent=this.settingsGuard(),current=()=>pluginCurrent()&&isCurrent();
@@ -937,13 +1265,14 @@ export default class SiyuanAICollab extends Plugin {
    check();
    const config={selectedConnectionId:input.connectionId||originalPreference,bridgeUrl:checkedBridgeUrl(input.url||originalUrl),capabilityToken:candidateToken};
    result=await(input.detect?detectLocalBridge(config,fetch,current):inspectLocalBridge(config,fetch,current));check();
-   if(!result.bridgeAuthenticated)return {...result,saveOutcome:'failed'};
+   if(!result.bridgeAuthenticated){const inspection:BridgeInspection={...result,saveOutcome:'failed'};this.settingsInspectionScopes.set(inspection,{url:result.url,token:candidateToken,connectionId:originalPreference});return inspection;}
    const saved=await this.readPluginSettings();check();
    if((typeof saved.bridgeToken==='string'&&saved.bridgeToken!==originalToken)||(typeof saved.bridgeUrl==='string'&&resolveBridgeUrl(saved)!==originalUrl)||saved.hermesConnectionId!==originalPreference)throw Error('连接设置或已保存偏好已变化，候选连接未保存，请重新核对');
    const candidate=result.connections?.find(v=>v.id===input.connectionId);
    // Legacy remains an explicit association destination, never a new-chat capability.
    const explicitLegacy=candidate?.kind==='legacy-api'&&['ready','configured'].includes(candidate.state);
-   const preference=result.hermesReady||explicitLegacy?result.selectedConnectionId:originalPreference;
+   const confirmService=input.bridgeOnly!==true&&(result.hermesReady||explicitLegacy);
+   const preference=confirmService?result.selectedConnectionId:originalPreference;
    const next={...saved,bridgeUrl:result.url,bridgeToken:candidateToken,...(preference?{hermesConnectionId:preference}:{})};
    check();writeStarted=true;
    await this.saveData('settings',next);check();
@@ -953,7 +1282,8 @@ export default class SiyuanAICollab extends Plugin {
    this.rememberThreads();for(const root of this.roomViews.keys())this.saveDraft(root);
    this.bridgeUrl=result.url;this.bridgeToken=candidateToken;
    if(preference){this.confirmedConnectionId=preference;this.selectedConnectionId=preference;}
-   result={...result,saveOutcome:result.hermesReady||explicitLegacy?'saved':'bridge-only',message:`${result.message}。Bridge 配对已保存；${result.hermesReady||explicitLegacy?'新建与关联目标已保留或确认':'尚未确认可用的新建目标，请核对服务后再确认'}`};
+   result={...result,saveOutcome:confirmService?'saved':'bridge-only',message:`${result.message}。Bridge 配对已保存；${confirmService?'新建与关联目标已保留或确认':'原目标保持，未确认新的服务目标'}`};
+   this.companionEvidence={url:this.bridgeUrl,token:this.bridgeToken,metadata:parseCompanionMetadata(result.evidence?.companion)};
    this.connectionViews=result.connections||this.connectionViews;this.connectionOk=this.currentConnectionReady();this.connectionText=result.message;
    if(changed){++this.historyVersion;++this.workLoadVersion;this.closeAssociation();for(const view of this.roomViews.values())view.connectionChanged();this.activateBridgeScope();}
   }catch(error){
@@ -970,10 +1300,10 @@ export default class SiyuanAICollab extends Plugin {
    if(!currentCommitted())throw Object.assign(Error('设置已保存，页面已变化；未更新原页面结果'),{saveOutcome:'unknown'});
   }
   for(const root of this.roomViews.keys()){this.renderConnectionChoices(root);this.renderConnection(root);this.renderStatus(root);}
-  this.workTab?.refresh();return result!;
+  this.workTab?.refresh();this.settingsInspectionScopes.set(result!,{url:result!.url,token:candidateToken,connectionId:this.confirmedConnectionId});return result!;
  }
- private async rememberSettingsInspection(run:()=>Promise<BridgeInspection>,current:()=>boolean,confirming=false):Promise<BridgeInspection>{
-  const version=++this.settingsReportVersion;
+ private async rememberSettingsInspection(run:()=>Promise<BridgeInspection>,current:()=>boolean,confirming=false,input?:BridgeSettingsInput):Promise<BridgeInspection>{
+  const version=++this.settingsReportVersion,scope=input?{url:input.url||this.bridgeUrl,token:input.token||this.bridgeToken,connectionId:this.confirmedConnectionId}:undefined;
   try{
    const result=await run();
    if(version===this.settingsReportVersion&&current()){
@@ -993,6 +1323,7 @@ export default class SiyuanAICollab extends Plugin {
    if((version===this.settingsReportVersion&&current())||(writeUnknown&&version>this.lastSettingsReportVersion)){
     this.lastSettingsSaveOutcome=this.lastSettingsSaveOutcome==='unknown'?'unknown':outcome;
     this.lastSettingsInspection=error instanceof BridgeInspectionError?{url:'',message:'',bridgeAuthenticated:false,hermesReady:false,evidence:error.evidence,saveOutcome:this.lastSettingsSaveOutcome||'not-requested'}:null;
+    if(this.lastSettingsInspection&&scope)this.settingsInspectionScopes.set(this.lastSettingsInspection,scope);
     this.lastSettingsReportVersion=version;
    }
    throw error;
@@ -1002,12 +1333,13 @@ export default class SiyuanAICollab extends Plugin {
   if(this.settingsDialog?.isBusy)return;
   this.settingsDialog?.dispose();
   this.settingsDialog=new SettingsDialog(document,{
-   bridgeUrl:()=>this.bridgeUrl,bridgeStatus:()=>this.connectionText,
+   bridgeUrl:()=>this.bridgeUrl,bridgeStatus:()=>this.connectionText,pairingPresent:()=>Boolean(this.bridgeToken),
    pluginVersion:()=>pluginManifest.version,confirmedKind:()=>this.connectionViews.find(view=>view.id===this.confirmedConnectionId)?.kind||null,lastInspection:()=>this.lastSettingsInspection,lastSaveOutcome:()=>this.lastSettingsSaveOutcome,
    connections:()=>this.connectionViews,currentConnection:()=>this.confirmedConnectionId||'',
-   save:async()=>{throw Error('请使用确认连接保存设置');},
-   inspectBridge:(input,current)=>this.rememberSettingsInspection(()=>this.inspectSettingsCandidate(input,current),current),
-   connectBridge:(input,current)=>this.rememberSettingsInspection(()=>this.connectSettingsBridge(input,current),current,true),
+   inspectionMatchesSaved:inspection=>{const scope=this.settingsInspectionScopes.get(inspection);return scope?scope.url===this.bridgeUrl&&scope.token===this.bridgeToken&&scope.connectionId===this.confirmedConnectionId:undefined;},
+   save:async()=>{throw Error('请点击“使用此连接”保存设置');},
+   inspectBridge:(input,current)=>this.rememberSettingsInspection(()=>this.inspectSettingsCandidate(input,current),current,false,input),
+   connectBridge:(input,current)=>this.rememberSettingsInspection(()=>this.connectSettingsBridge(input,current),current,true,input),
    defaultNotebookId:()=>this.defaultWorkNotebookId,
    listNotebooks:async()=>{await this.readWorkNotebookSetting();return this.workHost.listNotebooks();},
    saveDefaultNotebook:async id=>{
@@ -1071,6 +1403,6 @@ export default class SiyuanAICollab extends Plugin {
  private sessionChat(t:ChatThread,workId:string|null):SessionChat{return {workId,chatId:t.id,documentRootId:t.documentRootId,connectionId:t.connectionId||'unresolved',adapter:t.adapter,profile:t.profile,installId:t.installId||null,storedSessionId:t.storedSessionId||null,title:t.title,state:t.state,local:!t.connectionId};}
  private async listSessionChats(workId:string):Promise<SessionChat[]>{const links=await this.workStore.listChats(workId);const threads=this.threadWorkId===workId?this.threads:this.sessionMemory.scope(workId,this.connectionIdentity()).threads;return links.map(link=>({...link,title:threads.find(t=>t.id===link.chatId&&t.connectionId===link.connectionId)?.title||link.title}));}
  private async readBlockMarkdown(id:string){return parseKramdownResponse(await this.api('/api/block/getBlockKramdown',{id}));}
- private async api(path:string,body:Record<string,unknown>){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error(`SiYuan API ${r.status}`);const d:any=await r.json();if(d.code!==0)throw new Error(d.msg||'SiYuan API error');return d.data;}
+ private async api(path:string,body:Record<string,unknown>,signal?:AbortSignal){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal});if(!r.ok)throw new Error(`SiYuan API ${r.status}`);const d:any=await r.json();if(d.code!==0)throw new Error(d.msg||'SiYuan API error');return d.data;}
 }
 function escapeHtml(value:string){return value.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));}

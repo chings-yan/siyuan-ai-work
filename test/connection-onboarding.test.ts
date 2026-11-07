@@ -16,13 +16,14 @@ function ui(options:any={}){
  const click=(action:string)=>{const button=doc.querySelector<HTMLButtonElement>(`[data-settings-action="${action}"]`);assert.ok(button,`action ${action}`);button.click();};
  return {dom,doc,view,click,requests:()=>requests,writes:()=>writes,copied:()=>copied,close:()=>{view.dispose();dom.window.close();}};
 }
-test('four reversible steps allow Hermes without Work or EKKO; later returns focus and writes nothing',async()=>{
+test('single connection card allows Hermes without Work or EKKO; later returns focus and writes nothing',async()=>{
  const f=ui();try{
-  const steps=[...f.doc.querySelectorAll<HTMLDetailsElement>('[data-connection-step]')];assert.equal(steps.length,4);
-  assert.deepEqual(steps.map(s=>s.querySelector('summary')!.textContent),['1. 准备本机配套','2. 配对本机 Bridge','3. 选择 Hermes 服务','4. 确认连接结果']);
+  assert.equal(f.doc.querySelectorAll('[data-connection-card]').length,1);
+  assert.equal(f.doc.querySelectorAll('[data-connection-step]').length,1);
+  const pairing=f.doc.querySelector<HTMLDetailsElement>('[data-connection-step="pairing"]')!;assert.equal(pairing.open,true);
   assert.doesNotMatch(f.doc.querySelector('[data-settings-pane="hermes"]')!.textContent||'',/先整理 Work/);
   assert.match(f.doc.querySelector('[data-hermes-results-label]')!.textContent||'',/尚未检测/);
-  await f.click('detect-bridge');await tick();assert.equal(steps[0].open,false);assert.equal(steps[1].open,false);steps[1].open=true;assert.ok(f.doc.querySelector('[data-setting="bridgeToken"]'));
+  await f.click('detect-bridge');await tick();assert.equal(pairing.open,false);pairing.open=true;assert.ok(f.doc.querySelector('[data-setting="bridgeToken"]'));
   f.click('later');assert.equal(f.doc.querySelector('.sac-settings-overlay'),null);assert.equal(f.doc.activeElement?.id,'source');assert.equal(f.writes(),0);
  }finally{f.close();}
 });
@@ -34,13 +35,14 @@ function shownOutsideFold(element:Element):boolean{
  }
  return true;
 }
-test('maintenance and diagnostic explanations start folded while detection, candidate and confirmation stay visible',()=>{
+test('maintenance and diagnostics start folded while candidate and confirmation stay visible after inspection',()=>{
  const f=ui({lastInspection:()=>result()});try{
   for(const kind of ['maintenance','diagnostics','usage']){
    const help=f.doc.querySelector<HTMLDetailsElement>(`details[data-settings-help="${kind}"]`);
    assert.ok(help,`${kind} has a native labeled fold`);assert.equal(help.open,false);assert.ok(help.querySelector('summary')!.textContent!.trim());
   }
-  for(const selector of ['[data-settings-action="detect-bridge"]','[data-setting="hermesConnection"]','[data-hermes-results]','[data-hermes-results-label]','[data-hermes-authorization]','[data-bridge-status]','[data-settings-action="confirm-bridge"]'])assert.equal(shownOutsideFold(f.doc.querySelector(selector)!),true,selector);
+  for(const selector of ['[data-settings-action="detect-bridge"]','[data-setting="hermesConnection"]','[data-bridge-status]','[data-settings-action="confirm-bridge"]'])assert.equal(shownOutsideFold(f.doc.querySelector(selector)!),true,selector);
+  for(const selector of ['[data-hermes-results]','[data-hermes-results-label]','[data-hermes-authorization]'])assert.equal(shownOutsideFold(f.doc.querySelector(selector)!),false,selector);
   for(const action of ['help-serve','help-studio','help-legacy-api','view-diagnostic'])assert.equal(shownOutsideFold(f.doc.querySelector(`[data-settings-action="${action}"]`)!),false,action);
   assert.equal(shownOutsideFold(f.doc.querySelector('[data-companion-info]')!),false);
  }finally{f.close();}
@@ -187,4 +189,143 @@ test('a newer blocked check cannot erase the older pending write when it later b
   f.p.openSettings(f.root,'hermes');settingsAction(f,'confirm-bridge');await started;f.p.settingsDialog.dispose();f.p.openSettings(f.root,'hermes');settingsAction(f,'detect-bridge');await tick();assert.equal(f.p.settingsDialog.isBusy,false);
   release();await tick();f.p.settingsDialog.close();f.p.openSettings(f.root,'hermes');await tick();assertUnknownWrite(f);assert.equal(writes,1);assert.deepEqual(f.p.connectionViews,views);
  }finally{release?.();globalThis.fetch=fetchBefore;f.close();}
+});
+
+const serve={id:'fictional-serve',kind:'serve',state:'ready',profile:'private-serve-profile',installId:'fictional-install',displayName:'private-serve-title'};
+const card=(f:ReturnType<typeof ui>)=>f.doc.querySelector<HTMLElement>('[data-connection-card]')!;
+test('saved Studio reading remains the main result while unused Serve lacks authorization',async()=>{
+ const previous=result({connections:[{...serve,state:'auth_missing'},studio]});
+ const f=ui({pairingPresent:()=>true,currentConnection:()=>studio.id,confirmedKind:()=> 'studio',lastInspection:()=>previous,inspectBridge:async()=>previous});try{
+  assert.ok(card(f));assert.match(card(f).textContent||'',/当前连接：Hermes Studio/);assert.match(card(f).textContent||'',/上次.*会话读取正常/);
+  assert.doesNotMatch(card(f).textContent||'',/缺少服务授权|private-|fictional-token|fictional-serve/);
+  assert.equal(shownOutsideFold(f.doc.querySelector('[data-setting="hermesConnection"]')!),false);
+  assert.equal(shownOutsideFold(f.doc.querySelector('[data-setting="bridgeToken"]')!),false);
+  assert.equal(shownOutsideFold(f.doc.querySelector('[data-settings-action="confirm-bridge"]')!),false);
+  assert.match(f.doc.querySelector('[data-hermes-results]')!.textContent||'',/缺少服务授权/);
+  f.click('detect-bridge');await tick();assert.match(card(f).textContent||'',/已连接.*会话读取正常/);assert.match(card(f).textContent||'',new RegExp(checkedAt));assert.equal(f.writes(),0);
+ }finally{f.close();}
+});
+test('cached saved reading without a timestamp never claims a current online connection',()=>{
+ const f=ui({pairingPresent:()=>true,currentConnection:()=>studio.id,connections:()=>[studio]});try{assert.ok(card(f));assert.match(card(f).textContent||'',/上次.*会话读取正常/);assert.match(card(f).textContent||'',/时间未知|尚未检查/);assert.doesNotMatch(card(f).textContent||'',/已连接/);}finally{f.close();}
+});
+test('paired but unchecked setup hides credentials; first use shows preparation without an unknown write',()=>{
+ for(const paired of [false,true]){const f=ui({pairingPresent:()=>paired});try{
+  assert.ok(card(f));assert.match(card(f).textContent||'',/尚未连接|尚未检测/);assert.equal(shownOutsideFold(f.doc.querySelector('[data-setting="bridgeToken"]')!),!paired);
+  assert.equal(f.doc.querySelector('[data-settings-action="detect-bridge"]')!.textContent,'检查本机 Hermes');assert.doesNotMatch(card(f).textContent||'',/保存结果未知/);
+ }finally{f.close();}}
+});
+test('pairing rejection expands only pairing preparation while service denial keeps pairing hidden',async()=>{
+ for(const code of ['pairing_rejected','health_unreachable','ok']){
+  const failure=result({bridgeAuthenticated:code==='ok',hermesReady:false,connections:code==='ok'?[{...studio,state:'auth_failed'}]:undefined,evidence:{...result().evidence,code}});
+  const f=ui({pairingPresent:()=>true,currentConnection:()=>studio.id,confirmedKind:()=> 'studio',inspectBridge:async()=>failure});try{
+   f.click('detect-bridge');await tick();assert.ok(card(f));const status=card(f).textContent||'';
+   assert.equal(shownOutsideFold(f.doc.querySelector('[data-setting="bridgeToken"]')!),code==='pairing_rejected');
+   if(code==='ok'){assert.match(status,/原服务拒绝了授权/);assert.ok(card(f).querySelector('[data-settings-action="help-studio"]'));assert.doesNotMatch(status,/重新配对/);}
+   if(code==='health_unreachable')assert.match(status,/本机连接组件未响应/);
+   if(code==='pairing_rejected')assert.match(status,/配对凭据被拒绝/);
+  }finally{f.close();}
+ }
+});
+test('changing candidate keeps the exact saved target and exposes short choices and an explicit commit',async()=>{
+ const previous=result({connections:[serve,studio]});const f=ui({pairingPresent:()=>true,currentConnection:()=>studio.id,lastInspection:()=>previous});try{
+  f.click('change-bridge');const select=f.doc.querySelector<HTMLSelectElement>('[data-setting="hermesConnection"]')!;assert.equal(f.doc.activeElement,select);assert.equal(shownOutsideFold(select),true);
+  select.value=serve.id;select.dispatchEvent(new f.dom.window.Event('change',{bubbles:true}));
+  assert.match(card(f).querySelector('[data-current-service]')!.textContent||'',/Hermes Studio/);assert.doesNotMatch(card(f).querySelector('[data-current-service]')!.textContent||'',/Hermes 服务/);
+  assert.equal(shownOutsideFold(f.doc.querySelector('[data-settings-action="confirm-bridge"]')!),true);
+  assert.equal(f.doc.querySelector('[data-settings-action="confirm-bridge"]')!.textContent,'使用此连接');
+  assert.doesNotMatch(select.textContent||'',/已通过认证|请配置|原选择.*请核对/);assert.equal(f.requests(),0);assert.equal(f.writes(),0);
+  const maintenance=f.doc.querySelector<HTMLDetailsElement>('[data-settings-help="maintenance"]')!;assert.equal(maintenance.open,false);
+ }finally{f.close();}
+});
+test('missing saved target and multiple unconfirmed targets never impersonate an arbitrary ready service',async()=>{
+ for(const saved of ['', 'fictional-missing']){
+  const r=result({connections:[serve,studio],requiresSelection:true,selectedConnectionId:undefined});const f=ui({pairingPresent:()=>true,currentConnection:()=>saved,inspectBridge:async()=>r});try{
+   f.click('detect-bridge');await tick();assert.ok(card(f));assert.doesNotMatch(card(f).querySelector('[data-bridge-status]')!.textContent||'',/已连接/);
+   assert.match(card(f).textContent||'',saved?/当前连接未找到/:/尚未连接/);assert.equal(shownOutsideFold(f.doc.querySelector('[data-setting="hermesConnection"]')!),true);
+   assert.equal(shownOutsideFold(f.doc.querySelector('[data-settings-action="confirm-bridge"]')!),false);
+  }finally{f.close();}
+ }
+});
+test('partial Studio reading and missing sharing capability preserve current readiness with a short notice',async()=>{
+ const r=result({connections:[{...studio,readWarning:'studio_sessions_unresolved'}]});const f=ui({pairingPresent:()=>true,currentConnection:()=>studio.id,inspectBridge:async()=>r});try{
+  f.click('detect-bridge');await tick();assert.ok(card(f));assert.match(card(f).textContent||'',/已连接.*会话读取正常/);assert.match(card(f).textContent||'',/部分会话.*不可关联/);
+  assert.doesNotMatch(card(f).textContent||'',/hermes-shared-session|0\.3\.9|HTTP|强制升级/);assert.match(f.doc.querySelector('[data-companion-info]')!.textContent||'',/多文档共享.*更新/);
+ }finally{f.close();}
+});
+test('unknown write stays the main warning after successful reads and a candidate change',async()=>{
+ const f=ui({pairingPresent:()=>true,currentConnection:()=>studio.id,lastSaveOutcome:()=> 'unknown',lastInspection:()=>result()});try{
+  assert.ok(card(f));assert.match(card(f).querySelector('[data-bridge-status]')!.textContent||'',/保存结果未知.*不要重复提交/);
+  f.click('detect-bridge');await tick();f.click('change-bridge');assert.match(card(f).querySelector('[data-bridge-status]')!.textContent||'',/保存结果未知.*不要重复提交/);assert.equal(f.writes(),0);
+ }finally{f.close();}
+});
+test('single card close and reopen returns focus, clears draft credentials and resets folded maintenance',()=>{
+ const f=ui({pairingPresent:()=>true,currentConnection:()=>studio.id,lastInspection:()=>result()});try{
+  f.click('change-bridge');const maintenance=f.doc.querySelector<HTMLDetailsElement>('[data-settings-help="maintenance"]')!;maintenance.open=true;
+  const field=f.doc.querySelector<HTMLInputElement>('[data-setting="bridgeToken"]')!;field.value='fictional-draft-secret';
+  f.doc.querySelector<HTMLElement>('[data-settings-action="close"]')!.dispatchEvent(new f.dom.window.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+  assert.equal(f.doc.activeElement?.id,'source');assert.equal(f.doc.querySelector('[data-connection-card]'),null);
+  f.view.open(f.doc.querySelector('#source')!,'hermes');assert.ok(card(f));assert.equal(f.doc.querySelector<HTMLDetailsElement>('[data-settings-help="maintenance"]')!.open,false);assert.equal(f.doc.querySelector<HTMLInputElement>('[data-setting="bridgeToken"]')!.value,'');assert.equal(shownOutsideFold(f.doc.querySelector('[data-setting="hermesConnection"]')!),false);assert.equal(f.writes(),0);
+ }finally{f.close();}
+});
+
+test('actual plugin distinguishes stored pairing from startup preference without echoing credentials',async()=>{
+ for(const paired of [true,false]){const f=await fixture({confirmed:false});try{
+  if(!paired)f.p.bridgeToken='';f.p.workHost.listNotebooks=async()=>[];let writes=0;f.p.saveData=async()=>{writes++;};
+  f.p.openSettings(f.root,'hermes');await tick();const card=f.doc.querySelector('[data-connection-card]')!;assert.ok(card);
+  assert.match(card.querySelector('[data-current-service]')!.textContent||'',/尚未保存/);assert.doesNotMatch(card.querySelector('[data-bridge-status]')!.textContent||'',/已连接/);
+  const input=f.doc.querySelector<HTMLInputElement>('[data-setting="bridgeToken"]')!;assert.equal(shownOutsideFold(input),!paired);assert.equal(input.value,'');assert.doesNotMatch(f.doc.body.innerHTML,/fictional-token/);assert.equal(f.input.value,'原 Chat 草稿');assert.equal(writes,0);
+ }finally{f.p.settingsDialog?.dispose();f.close();}}
+});
+test('a different candidate address cannot rename or verify the saved service',async()=>{
+ const different=result({url:'http://127.0.0.1:8789',connections:[{...studio,id:serve.id}]});
+ const f=ui({pairingPresent:()=>true,currentConnection:()=>serve.id,confirmedKind:()=> 'serve',connections:()=>[serve],inspectBridge:async()=>different});try{
+  f.click('change-bridge');const url=f.doc.querySelector<HTMLInputElement>('[data-setting="baseUrl"]')!;url.value=different.url;url.dispatchEvent(new f.dom.window.Event('input',{bubbles:true}));f.click('check-bridge');await tick();
+  assert.equal(card(f).querySelector('[data-current-service]')!.textContent,'当前连接：Hermes 服务');assert.doesNotMatch(card(f).querySelector('[data-bridge-status]')!.textContent||'',/已连接/);assert.match(card(f).textContent||'',/候选地址/);assert.equal(f.writes(),0);
+ }finally{f.close();}
+});
+test('short service options retain offline meaning and keep full fixed advice in maintenance',()=>{
+ const f=ui({connections:()=>[{...serve,state:'offline'},studio]});try{
+  const select=f.doc.querySelector<HTMLSelectElement>('[data-setting="hermesConnection"]')!;assert.match(select.options[1].textContent||'',/Hermes 服务.*未连接/);assert.doesNotMatch(select.textContent||'',/可能未运行|请启动后|核验|已通过认证/);assert.match(f.doc.querySelector('[data-hermes-results]')!.textContent||'',/可能未运行或不可达，请启动后重试/);
+ }finally{f.close();}
+});
+
+test('explicit legacy destination stays selectable for original single-document associations',async()=>{
+ for(const state of ['ready','configured']){
+  const legacy={...studio,id:'fictional-legacy',kind:'legacy-api',state},r=result({connections:[legacy],selectedConnectionId:undefined,hermesReady:false});
+  const f=ui({pairingPresent:()=>true,inspectBridge:async()=>r});try{
+   f.click('detect-bridge');await tick();const select=f.doc.querySelector<HTMLSelectElement>('[data-setting="hermesConnection"]')!;select.value=legacy.id;select.dispatchEvent(new f.dom.window.Event('change',{bubbles:true}));
+   assert.equal(shownOutsideFold(f.doc.querySelector('[data-settings-action="confirm-bridge"]')!),true);assert.match(card(f).querySelector('[data-candidate-status]')!.textContent||'',/仅可关联旧会话|只可关联旧会话/);assert.doesNotMatch(card(f).querySelector('[data-bridge-status]')!.textContent||'',/已连接/);
+  }finally{f.close();}
+ }
+});
+
+test('maintenance only opens the card confirmation; checking stays read-only and only Use writes',async()=>{
+ let writes=0,checks=0;
+ const f=ui({pairingPresent:()=>true,lastInspection:()=>result(),inspectBridge:async()=>{checks++;return result();},connectBridge:async()=>{writes++;return result({saveOutcome:'saved'});}});try{
+  f.doc.querySelector<HTMLDetailsElement>('[data-settings-help="maintenance"]')!.open=true;
+  const entry=f.doc.querySelector<HTMLButtonElement>('[data-settings-action="prepare-bridge"],[data-settings-action="save"]')!;assert.ok(entry);entry.click();await tick();
+  assert.equal(writes,0,'maintenance must not commit before Use this connection');assert.equal(checks,0);assert.equal(f.doc.querySelector('[data-settings-action="save"]'),null);
+  const confirm=f.doc.querySelector<HTMLButtonElement>('[data-settings-action="confirm-bridge"]')!;assert.equal(confirm.textContent,'使用此连接');assert.equal(shownOutsideFold(confirm),true);assert.equal(f.doc.activeElement,confirm);
+  f.click('check-bridge');await tick();assert.equal(checks,1);assert.equal(writes,0);f.click('confirm-bridge');await tick();assert.equal(writes,1);
+ }finally{f.close();}
+});
+test('authenticated inspection with no selectable service offers truthful Bridge-only confirmation in the card',async()=>{
+ for(const views of [[],[{...studio,state:'offline'}]]){
+  const written:any[]=[];
+  const inspected=result({connections:views,selectedConnectionId:undefined,hermesReady:false});
+  const f=ui({pairingPresent:()=>true,currentConnection:()=> 'fictional-original-target',inspectBridge:async()=>inspected,connectBridge:async(input:any)=>{written.push(input);return {...inspected,saveOutcome:'bridge-only'};}});try{
+   f.click('detect-bridge');await tick();const confirm=f.doc.querySelector<HTMLButtonElement>('[data-settings-action="confirm-bridge"]')!;
+   assert.equal(shownOutsideFold(confirm),true);assert.equal(confirm.textContent,'使用此连接');assert.match(f.doc.querySelector('[data-candidate-status]')!.textContent||'',/仅保存 Bridge.*配对.*保留.*目标/);assert.equal(written.length,0);
+   confirm.click();await tick();assert.equal(written.length,1);assert.equal(written[0].bridgeOnly,true);assert.doesNotMatch(f.doc.querySelector('[data-bridge-status]')!.textContent||'',/已连接/);
+  }finally{f.close();}
+ }
+});
+test('maintenance cannot offer Bridge-only confirmation without authenticated reading or instead of choosing ready services',async()=>{
+ for(const inspected of [null,result({bridgeAuthenticated:false,connections:undefined,evidence:{...result().evidence,code:'pairing_rejected'}}),result({connections:[serve,studio],selectedConnectionId:undefined,requiresSelection:true})]){
+  const f=ui({pairingPresent:()=>true,lastInspection:()=>inspected});try{
+   const entry=f.doc.querySelector<HTMLButtonElement>('[data-settings-action="prepare-bridge"]');assert.ok(entry);entry.click();
+   const confirm=f.doc.querySelector<HTMLButtonElement>('[data-settings-action="confirm-bridge"]')!;assert.equal(shownOutsideFold(confirm),false);assert.equal(f.writes(),0);assert.equal(f.requests(),0);
+   if(!inspected)assert.match(f.doc.querySelector('[data-candidate-status]')!.textContent||'',/检查连接/);
+  }finally{f.close();}
+ }
 });
