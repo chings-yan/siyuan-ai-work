@@ -6,7 +6,6 @@ import { build } from 'esbuild';
 import JSZip from 'jszip';
 
 const scriptRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const frontendFiles = ['plugin.json', 'README.md', 'index.js'];
 const companionEntries = ['bridge.mjs', 'bridge-supervisor.mjs', 'pair.mjs'];
 const windowsEntries = ['prepare-bridge.cmd', 'start-bridge.cmd'];
 const serveLauncher = 'hermes-serve-launcher.mjs';
@@ -17,6 +16,12 @@ const slash = value => value.split(sep).join('/');
 
 async function optionalStat(path) {
   try { return await lstat(path); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
+export function frontendPackageFiles(manifest) {
+  const files = ['plugin.json', 'README.md', 'index.js'];
+  if (manifest.icon === undefined) return files;
+  if (manifest.icon !== 'icon.png') throw new Error('The marketplace icon must be declared as icon.png');
+  return [...files, manifest.icon];
 }
 export async function readProjectLicense(root, pkg) {
   // Historical unlicensed fixtures retain their original distribution contract.
@@ -122,6 +127,13 @@ export async function buildPackages(root = scriptRoot) {
   const manifest = JSON.parse(await readFile(join(root, 'plugin.json'), 'utf8'));
   if (pkg.name !== 'siyuan-ai-collab' || manifest.name !== pkg.name || manifest.version !== pkg.version) {
     throw new Error('Plugin identity and version must match package.json');
+  }
+  const frontendFiles = frontendPackageFiles(manifest);
+  if (manifest.icon) {
+    const icon = await optionalStat(join(root, manifest.icon));
+    if (!icon?.isFile() || icon.size === 0 || icon.size > 64 * 1024) {
+      throw new Error('The marketplace icon must be a regular icon.png file up to 64 KiB');
+    }
   }
   const projectLicense = await readProjectLicense(root, pkg);
   for (const file of windowsEntries) {

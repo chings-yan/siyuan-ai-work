@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160">
+  <title>Hermes 笔记助手</title>
+  <defs>
+    <linearGradient id="surface" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#138174"/>
+      <stop offset="100%" stop-color="#133947"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="152" height="152" rx="34" fill="url(#surface)"/>
+  <rect x="5" y="5" width="150" height="150" rx="33" fill="none" stroke="#408680" stroke-width="1.5"/>
+  <path d="M50 42H90L115 67V110Q115 124 101 124H74L55 138V124H50Q36 124 36 110V56Q36 42 50 42Z" fill="#15444D"/>
+  <path d="M50 38H90L115 63V106Q115 120 101 120H74L55 134V120H50Q36 120 36 106V52Q36 38 50 38Z" fill="#F4FFF9"/>
+  <path d="M90 38L115 63H99Q90 63 90 54Z" fill="#C7EDE1"/>
+  <path d="M54 70H92M54 85H91M54 100H77" fill="none" stroke="#207A71" stroke-width="6.5" stroke-linecap="round"/>
+  <path d="M120 18Q123 35 140 38Q123 41 120 58Q117 41 100 38Q117 35 120 18Z" fill="#BBF6C5"/>
+</svg>

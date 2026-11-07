@@ -4,12 +4,18 @@ import { spawnSync } from 'node:child_process';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
-import { readProjectLicense } from './package.mjs';
+import { frontendPackageFiles, readProjectLicense } from './package.mjs';
 
 const scriptRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const gitBlob = bytes => createHash('sha1').update(Buffer.concat([Buffer.from(`blob ${bytes.length}\0`), bytes])).digest('hex');
-const publicRoots = new Set(['.gitignore', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASE.md', 'package.json', 'package-lock.json', 'plugin.json', 'tsconfig.json', 'docs/BRIDGE-SETUP.md', '.github/workflows/publish-0.3.25.yml', '.github/workflows/publish-0.3.26.yml']);
+const publicRoots = new Set([
+  '.gitignore', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASE.md',
+  'package.json', 'package-lock.json', 'plugin.json', 'tsconfig.json',
+  'icon.png', 'assets/icon.svg', 'docs/BRIDGE-SETUP.md',
+  '.github/workflows/publish-0.3.25.yml', '.github/workflows/publish-0.3.26.yml',
+  '.github/workflows/publish-0.3.27.yml',
+]);
 function safePath(path) {
   return typeof path === 'string' && path.length > 0 && !isAbsolute(path) && !/[\\\u0000-\u001f\u007f<>:"|?*]/.test(path) && path.split('/').every(part => part && part !== '.' && part !== '..' && !/[. ]$/.test(part));
 }
@@ -73,9 +79,16 @@ export async function createReleaseArtifacts(root = scriptRoot) {
   if (packages.name !== pkg.name || packages.version !== pkg.version || packages.plugin?.file !== 'package.zip' || packages.companion?.file !== 'bridge-companion.zip') throw new Error('Built package identity or version differs from source');
   const frontend = await archive(root, packages.plugin, license);
   const companion = await archive(root, packages.companion, license);
-  if (JSON.stringify(Object.keys(frontend.zip.files).sort()) !== JSON.stringify(['LICENSE', 'README.md', 'index.js', 'plugin.json'].sort())) throw new Error('Frontend archive whitelist differs');
+  const frontendFiles = [...frontendPackageFiles(plugin), 'LICENSE'].sort();
+  if (JSON.stringify(Object.keys(frontend.zip.files).sort()) !== JSON.stringify(frontendFiles)) throw new Error('Frontend archive whitelist differs');
   const archivedPlugin = JSON.parse(await frontend.zip.file('plugin.json').async('string'));
   if (JSON.stringify(archivedPlugin) !== JSON.stringify(plugin)) throw new Error('Frontend package identity differs from source');
+  if (plugin.icon) {
+    const iconPath = join(root, plugin.icon);
+    if (!names.has(plugin.icon)) throw new Error('The marketplace icon must be tracked in the release source');
+    await regular(iconPath);
+    if (!(await frontend.zip.file(plugin.icon).async('nodebuffer')).equals(await readFile(iconPath))) throw new Error('Frontend marketplace icon differs from source');
+  }
   const identity = JSON.parse(await companion.zip.file('companion-manifest.json')?.async('string') || 'null');
   if (identity?.pluginName !== pkg.name || identity?.pluginVersion !== pkg.version || identity?.track !== packages.track) throw new Error('Companion identity differs from source');
 

@@ -111,10 +111,29 @@ test('distribution contains standard front-end ZIP and runnable companion, witho
   } finally { await cleanup(root); }
 });
 
+test('distribution includes the declared marketplace icon with the original bytes', async () => {
+  const root = await fixture();
+  try {
+    const icon = await readFile(join(project, 'icon.png'));
+    assert.ok(icon.length <= 64 * 1024);
+    assert.equal(icon.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+    assert.deepEqual([icon.readUInt32BE(16), icon.readUInt32BE(20)], [160, 160]);
+    await writeFile(join(root, 'plugin.json'), JSON.stringify({
+      name: 'siyuan-ai-collab', version: '0.2.17', icon: 'icon.png',
+    }));
+    await writeFile(join(root, 'icon.png'), icon);
+    await execute(process.execPath, [join(root, 'scripts/package.mjs')], { cwd: root, timeout: 20000 });
+    const zip = await JSZip.loadAsync(await readFile(join(root, 'dist/package.zip')), { checkCRC32: true });
+    const entry = zip.file('icon.png');
+    assert.ok(entry, 'A declared marketplace icon must be in the plugin archive');
+    assert.deepEqual(await entry.async('nodebuffer'), icon);
+  } finally { await cleanup(root); }
+});
+
 test('extracted actual companion imports without side effects and serves controlled health/auth checks without installed dependencies', async () => {
   const root = await fixture();
   try {
-    for (const name of ['package.json', 'plugin.json']) await copyFile(join(project, name), join(root, name));
+    for (const name of ['package.json', 'plugin.json', 'icon.png']) await copyFile(join(project, name), join(root, name));
     await copyFile(join(project, 'LICENSE'), join(root, 'LICENSE'));
     for (const name of runtimeSources) await copyFile(join(project, 'scripts', name), join(root, 'scripts', name));
     for (const entry of windowsEntries) await copyFile(join(project, 'scripts', entry), join(root, 'scripts', entry));
