@@ -16,6 +16,7 @@ const publicRoots = new Set([
   '.github/workflows/publish-0.3.25.yml', '.github/workflows/publish-0.3.26.yml',
   '.github/workflows/publish-0.3.27.yml',
   '.github/workflows/refresh-release-copy-0.3.27.yml',
+  '.github/workflows/publish-0.3.28.yml',
 ]);
 function safePath(path) {
   return typeof path === 'string' && path.length > 0 && !isAbsolute(path) && !/[\\\u0000-\u001f\u007f<>:"|?*]/.test(path) && path.split('/').every(part => part && part !== '.' && part !== '..' && !/[. ]$/.test(part));

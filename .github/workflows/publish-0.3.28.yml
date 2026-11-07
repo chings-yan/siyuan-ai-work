@@ -1,0 +1,139 @@
+name: Publish reviewed 0.3.28
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/publish-0.3.28.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-0.3.28
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'chings-yan/siyuan-ai-work' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out the exact public commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Check fixed release identity
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+          const plugin = JSON.parse(readFileSync('plugin.json', 'utf8'));
+          if (pkg.name !== 'siyuan-ai-collab' || pkg.version !== '0.3.28' || pkg.license !== 'AGPL-3.0-only' || plugin.version !== pkg.version || plugin.url !== 'https://github.com/chings-yan/siyuan-ai-work') throw new Error('This one-time workflow only publishes the approved 0.3.28 source');
+          const readme = readFileSync('README.md');
+          if (!readme.equals(readFileSync('RELEASE.md')) || createHash('sha256').update(readme).digest('hex') !== 'e82deac696df5ecc12da766c803111e6165296519aa085082d12036fef72129d') throw new Error('Marketplace description differs from the approved copy');
+          NODE
+      - name: Install the locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Type, build, default tests, package, default tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx tsc --noEmit
+          npm run build
+          for phase in before after; do
+            if [ "$phase" = after ]; then npm run package; fi
+            NODE_OPTIONS=--test-reporter=tap npm test | tee "test-$phase.log"
+            node --input-type=module - "$phase" <<'NODE'
+          import { readFileSync } from 'node:fs';
+          const text = readFileSync(`test-${process.argv[2]}.log`, 'utf8');
+          const values = Object.fromEntries(['tests', 'pass', 'fail', 'cancelled', 'skipped', 'todo'].map(key => [key, Number(new RegExp(`^# ${key} (\\d+)\\r?$`, 'm').exec(text)?.[1] ?? NaN)]));
+          if (values.tests !== 2614 || values.pass !== 2614 || ['fail', 'cancelled', 'skipped', 'todo'].some(key => values[key] !== 0)) throw new Error(`Default full-suite release gate failed: ${JSON.stringify(values)}`);
+          NODE
+          done
+      - name: Generate and read back the six release assets
+        run: |
+          node scripts/release-artifacts.mjs
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          import JSZip from 'jszip';
+          const archive = await JSZip.loadAsync(readFileSync('dist/package.zip'), { checkCRC32: true });
+          const readme = archive.file('README.md');
+          if (!readme || !(await readme.async('nodebuffer')).equals(readFileSync('README.md'))) throw new Error('Packaged marketplace copy differs from README.md');
+          NODE
+      - name: Transfer the verified assets and public release notes
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reviewed-0.3.28-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          path: |
+            dist/package.zip
+            dist/bridge-companion.zip
+            dist/siyuan-ai-collab-0.3.28-source.zip
+            dist/package-manifest.json
+            dist/source-manifest.json
+            dist/SHA256SUMS
+            RELEASE.md
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download only this run's verified immutable artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact-id }}
+          path: release
+          digest-mismatch: error
+      - name: Verify transfer, refuse existing release or tag, publish once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: chings-yan/siyuan-ai-work
+          EXPECTED_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find release -type f | wc -l)" -eq 7
+          cd release/dist
+          sha256sum --strict --check SHA256SUMS
+          jq -e --arg commit "$EXPECTED_SHA" '.commit == $commit and .version == "0.3.28" and .license == "AGPL-3.0-only"' source-manifest.json
+          cd ../..
+          for endpoint in releases/tags/v0.3.28 git/ref/tags/v0.3.28; do
+            if gh api "repos/$GH_REPO/$endpoint" > existing-release.json 2> existing-release.err; then
+              printf '%s\n' 'The release or tag already exists. Stop for read-only verification; do not overwrite.' >&2
+              exit 1
+            elif ! grep -q '(HTTP 404)' existing-release.err; then
+              cat existing-release.err >&2
+              exit 1
+            fi
+          done
+          gh release create v0.3.28 \
+            release/dist/package.zip \
+            release/dist/bridge-companion.zip \
+            release/dist/siyuan-ai-collab-0.3.28-source.zip \
+            release/dist/package-manifest.json \
+            release/dist/source-manifest.json \
+            release/dist/SHA256SUMS \
+            --repo "$GH_REPO" --target "$EXPECTED_SHA" \
+            --title 'Hermes 笔记助手 0.3.28' --notes-file release/RELEASE.md --latest
+          gh api "repos/$GH_REPO/releases/tags/v0.3.28" --jq '{url: .html_url, tag: .tag_name, draft: .draft, prerelease: .prerelease, assets: [.assets[] | {name, size, digest, state}]}'

@@ -2,7 +2,7 @@
   "name": "siyuan-ai-collab",
   "author": "chings-yan",
   "url": "https://github.com/chings-yan/siyuan-ai-work",
-  "version": "0.3.27",
+  "version": "0.3.28",
   "minAppVersion": "3.8.4",
   "backends": [
     "windows"
@@ -16,7 +16,7 @@
   },
   "description": {
     "default": "Bring Hermes collaboration into SiYuan by linking documents, conversations, and tasks in one workspace. Requires Hermes to be installed first.",
-    "zh-CN": "将 Hermes 协作融入思源，把文档、对话和任务关联起来，集中到同一个工作空间。使用前需安装 Hermes。"
+    "zh-CN": "让 Hermes 融入思源，把文档、对话和任务串成一个工作空间。使用前需先安装 Hermes。"
   },
   "readme": {
     "default": "README.md",
